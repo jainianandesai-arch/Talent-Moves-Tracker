@@ -3,14 +3,16 @@ Talent Moves Tracker
 ---------------------
 Competitive talent-intelligence tool for Manulife People Analytics.
 
-Two input paths feed every report:
-  1. LIVE, no-key public APIs (StatCan WDS, BLS, SEC EDGAR) — wired directly,
-     cached, every value carries a source + retrieval timestamp.
-  2. MANUAL-PASTE — rule-based text extraction (no LLM) for sources with no
-     usable public API (trade press, career pages, SEDAR+, WARN notices).
+Fully live, no manual data entry anywhere: StatCan WDS, BLS, and SEC EDGAR
+public APIs, plus two trade-press RSS feeds (Executive Moves, Insurance Edge)
+filtered to the 10 locked peer companies and parsed automatically into the
+move table. Sections with no viable free/no-key live source (Workforce &
+Talent Strategy; company-specific job-posting counts) are left honestly
+blank rather than faked or backed by a paste box — see the Methodology tab
+for the full list of sources tested and rejected.
 
-Every section of the UI is labeled with which path it's on. Nothing here
-blends a "Disclosed fact" (from a named filing/press release) with an
+Every section of the UI is labeled with which live source it's on. Nothing
+here blends a "Disclosed fact" (from a named filing/article) with an
 "Inferred signal" (a pattern we noticed) without saying which is which.
 
 See live_sources.py for the API fetch functions and a record of which
@@ -289,6 +291,17 @@ ROLE_WORDS = {
 }
 
 
+def _trim_trailing_role_words(candidate: str) -> str:
+    """Cut a candidate off at the first title/role word a greedy capture pulled
+    in, e.g. "John Smith Chief Risk" -> "John Smith" (the title starts at
+    "Chief", which is not necessarily the last word captured)."""
+    words = candidate.split()
+    for i, w in enumerate(words):
+        if w.rstrip(",").lower().rstrip("'s") in ROLE_WORDS:
+            return " ".join(words[:i])
+    return candidate
+
+
 def _looks_like_person_name(candidate: str) -> bool:
     if not candidate:
         return False
@@ -313,12 +326,12 @@ def extract_person(line: str) -> str:
         line,
     )
     if match:
-        candidate = match.group(1).strip()
+        candidate = _trim_trailing_role_words(match.group(1).strip())
         if _looks_like_person_name(candidate):
             return candidate
 
     for match in re.finditer(r",\s*([A-Z][a-zA-Z.\'-]+(?:\s+[A-Z][a-zA-Z.\'-]+){1,2})\s*,", line):
-        candidate = match.group(1).strip()
+        candidate = _trim_trailing_role_words(match.group(1).strip())
         if _looks_like_person_name(candidate):
             return candidate
 
@@ -327,7 +340,7 @@ def extract_person(line: str) -> str:
         candidate = match.group(1).strip()
         for company in ALL_KNOWN_COMPANIES:
             candidate = re.sub(r"\s+" + re.escape(company) + r"$", "", candidate, flags=re.IGNORECASE)
-        candidate = candidate.strip()
+        candidate = _trim_trailing_role_words(candidate.strip())
         if _looks_like_person_name(candidate):
             return candidate
 
@@ -445,15 +458,25 @@ class Move:
     title_delta: str = ""
     function: str = ""
     raw_text: str = ""
+    input_method: str = "Manual paste"
 
 
 MOVE_COLUMNS = [
     "Person", "Direction", "Prior Title", "New Title", "Prior Company",
-    "New Company", "Date", "Source", "Title Delta", "Function", "Raw Text",
+    "New Company", "Date", "Source", "Title Delta", "Function", "Raw Text", "Input Method",
 ]
 
 
-def parse_moves(text: str) -> pd.DataFrame:
+def parse_moves(text: str, input_method: str = "Manual paste", default_source: str = "") -> pd.DataFrame:
+    """Parse raw text into structured moves.
+
+    input_method tags every resulting row (e.g. "Manual paste" or
+    "Auto (Executive Moves)") so the review table always shows where a row
+    came from — auto-fetched rows still need a human glance before they're
+    treated as fact, per governance, but they no longer require re-typing.
+    default_source is used when a line has no inline source attribution of
+    its own (e.g. an RSS headline whose "source" is simply the feed itself).
+    """
     lines = split_into_candidate_lines(text)
     moves: list[Move] = []
 
@@ -463,7 +486,7 @@ def parse_moves(text: str) -> pd.DataFrame:
         companies = extract_companies(line)
         person = extract_person(line)
         move_date = extract_date(line)
-        source = extract_source(line)
+        source = extract_source(line) or default_source
 
         prior_company, new_company = "", ""
         if companies:
@@ -484,7 +507,7 @@ def parse_moves(text: str) -> pd.DataFrame:
             Move(
                 person=person, direction=direction, prior_title=prior_title, new_title=new_title,
                 prior_company=prior_company, new_company=new_company, date=move_date, source=source,
-                title_delta=title_delta, function=function, raw_text=line,
+                title_delta=title_delta, function=function, raw_text=line, input_method=input_method,
             )
         )
 
@@ -497,11 +520,38 @@ def parse_moves(text: str) -> pd.DataFrame:
                 "Person": m.person, "Direction": m.direction, "Prior Title": m.prior_title,
                 "New Title": m.new_title, "Prior Company": m.prior_company, "New Company": m.new_company,
                 "Date": m.date, "Source": m.source, "Title Delta": m.title_delta,
-                "Function": m.function, "Raw Text": m.raw_text,
+                "Function": m.function, "Raw Text": m.raw_text, "Input Method": m.input_method,
             }
             for m in moves
         ]
     )
+
+
+def fetch_auto_trade_press_moves() -> tuple[pd.DataFrame, dict]:
+    """Fetch trade-press RSS feeds live, filter to locked peers, and parse each
+    matched headline into a structured move row automatically — no paste step.
+
+    Every row is tagged Input Method = "Auto (<feed name>)" and Source = the
+    article link, so it's still clear this came from an unreviewed live pull,
+    not a human-confirmed paste. Returns (moves_df, raw_fetch_result) so the
+    UI can show the raw fetch result (timestamp, errors) alongside the table.
+    """
+    result = cached_fetch_trade_press()
+    frames = []
+    for match in result["data"]:
+        row_df = parse_moves(
+            match["title"],
+            input_method=f"Auto ({match['feed']})",
+            default_source=match["link"],
+        )
+        if not row_df.empty:
+            if not row_df.at[0, "Date"]:
+                row_df.at[0, "Date"] = match["pub_date"]
+            frames.append(row_df)
+
+    if not frames:
+        return pd.DataFrame(columns=MOVE_COLUMNS), result
+    return pd.concat(frames, ignore_index=True), result
 
 
 # ---------------------------------------------------------------------------
@@ -647,12 +697,12 @@ def compute_company_flag(peer: str, moves_df: pd.DataFrame | None, sec_result: d
             if outbound_n > 0:
                 flag = FLAG_RED
                 notes.append(
-                    f"{outbound_n} outbound move(s) logged this pull (Disclosed fact, from pasted source text)."
+                    f"{outbound_n} outbound move(s) found in live trade-press feeds this pull (Disclosed fact)."
                 )
             elif inbound_n or internal_n:
                 flag = FLAG_GREEN
                 notes.append(
-                    f"{inbound_n} inbound / {internal_n} internal move(s) logged this pull (Disclosed fact)."
+                    f"{inbound_n} inbound / {internal_n} internal move(s) found in live trade-press feeds this pull (Disclosed fact)."
                 )
 
     if sec_result is not None:
@@ -679,7 +729,7 @@ def compute_company_flag(peer: str, moves_df: pd.DataFrame | None, sec_result: d
             notes.append(f"SEC EDGAR lookup unavailable for this peer: {sec_result['error']}")
 
     if not notes:
-        notes.append("No new activity captured this pull — paste trade-press text in Talent Flow Detail to add signal.")
+        notes.append("No live signal this pull — no matching trade-press headline or recent SEC filing found.")
 
     return flag, " ".join(notes)
 
@@ -693,7 +743,7 @@ def build_bottom_line(market: str, flags: dict[str, str], macro_result: dict) ->
     elif green_peers:
         headline = f"{', '.join(green_peers)} show notable activity this pull (see each line for whether that's a logged move or a filing to review); no outbound signal logged."
     else:
-        headline = "No peer shows a live or pasted signal this pull — this is a quiet snapshot, not a data gap."
+        headline = "No peer shows a live signal this pull — this is a quiet snapshot, not a data gap."
 
     macro_note = ""
     if macro_result.get("ok"):
@@ -738,37 +788,40 @@ Canada and US reports are always shown separately — never merged into one cros
   **not** auto-detected — the flag points you to read the filing, it does not claim to
   already know what's in it.
 
-### Trade-press RSS feeds (live, filtered)
+### Trade-press RSS feeds (live, filtered, fully automatic)
 - **Executive Moves** (`executive-moves.com` — note the hyphen; `executivemoves.com` without
   one is an unrelated parked domain-for-sale page) and **Insurance Edge** (`insurance-edge.net`)
-  both publish real, robots.txt-permitted RSS feeds. This tool fetches them live and keeps only
-  items whose title/description mentions one of the 10 locked peer companies — nothing is
-  auto-added to the move table; matches are surfaced for manual review and paste, per the
-  human-review requirement below. Most pulls will legitimately return zero matches since these
-  are general industry feeds, not peer-specific.
+  both publish real, robots.txt-permitted RSS feeds. This tool fetches them live on every load,
+  keeps only items whose title/description mentions one of the 10 locked peer companies, and
+  parses each matched headline directly into the move table — **no paste, no manual entry**.
+  Most pulls will legitimately return zero matches since these are general global insurance
+  feeds, not peer-specific — an empty table most weeks is the correct, honest result of that,
+  not a broken feature.
 
 ### Sources tested and found NOT viable as live feeds (documented so no one re-tries blind)
 - **Job Bank Canada** open-data postings file: real, no-key, ~50K postings/month —
   but has **no employer-name field**. Usable only for national/NOC-level stats
-  (e.g. total actuarial postings in Canada), not company-specific counts.
+  (e.g. total actuarial postings in Canada), not company-specific counts. Not wired in.
 - **Adzuna API**: requires a registered app_id/app_key (confirmed via a live
   AUTH_FAIL response) — not wired in without real credentials.
 - **Company career pages** (e.g. Manulife's own): confirmed bot-blocked
   (Akamai "Access Denied" on a direct request) — this tool does not attempt to
-  bypass bot detection. Job-posting counts from career pages stay manual-paste.
+  bypass bot detection. Job-posting counts from career pages are not available here.
 - **SEDAR+, Ontario Mass Termination Notices, US WARN Act notices**: no public
-  machine-readable API found — manual-paste only.
+  machine-readable API found. Not wired in.
+- **Workforce & Talent Strategy** (AI upskilling programs, wellness benefits, RTO
+  mandates, etc.): no structured public API surfaces this as fetchable data — left
+  blank in this version rather than faked or manually typed.
 
-### What counts as a valid tracked move (manual-paste path)
+### What counts as a valid tracked move
 - **Person** — a named individual (not "a spokesperson" or anonymous reference)
 - **Prior or New role context** — at least one side of the move
-- **Explicit source attribution** — a named press release, outlet, or filing
+- **Explicit source attribution** — the originating feed article, always linked
 
-### Excluded from the manual-paste path
-- LinkedIn scraping or bulk profile monitoring — this tool only processes text a
-  user has manually pasted from a specific, identifiable source.
-- Unconfirmed rumor or anonymous "sources say" content, unless from a reputable
-  named outlet reporting on the record.
+### Permanently excluded from this tool
+- LinkedIn scraping/API or bulk profile monitoring of any kind.
+- Manual data entry of any kind — every row in this tool comes from a live,
+  no-key public source, fetched and parsed automatically.
 - Non-leadership/non-executive personnel changes.
 
 ### Role/function grouping — provisional
@@ -874,17 +927,12 @@ def render_sidebar() -> tuple[str, list[str]]:
             cached_fetch_statcan.clear()
             cached_fetch_bls.clear()
             cached_fetch_sec.clear()
+            cached_fetch_trade_press.clear()
             st.rerun()
-        st.caption("Live sources are cached for 1 hour to respect free-tier rate limits.")
-
-        st.divider()
-        st.subheader("Manual-paste input")
-        if st.button("Load sample text"):
-            st.session_state["source_text"] = SAMPLE_TEXT.strip()
-            st.session_state.pop("parsed_df", None)
-        if st.button("Clear all"):
-            st.session_state["source_text"] = ""
-            st.session_state.pop("parsed_df", None)
+        st.caption(
+            "Every source below is fetched live — no paste, no manual entry. Cached up to 1 hour "
+            "to respect free-tier rate limits; use Refresh to force a new pull."
+        )
 
     return market, selected_peers
 
@@ -892,8 +940,9 @@ def render_sidebar() -> tuple[str, list[str]]:
 def render_live_report_tab(market: str, peers: list[str], moves_df: pd.DataFrame | None) -> tuple[dict, str, str]:
     st.subheader(f"{market} — Live Snapshot")
     st.caption(
-        "🔴 concerning signal · 🟢 notable move · ⚪ nothing new this pull. Each line names its source "
-        "and whether it's a Disclosed fact or an Inferred signal — never blended."
+        "🔴 concerning signal · 🟢 notable move · ⚪ nothing new this pull. Fully live — no paste, no "
+        "manual entry. Each line names its source and whether it's a Disclosed fact or an Inferred "
+        "signal — never blended."
     )
 
     flags: dict[str, tuple[str, str]] = {}
@@ -969,81 +1018,47 @@ def render_labour_market_tab(market: str) -> str:
     return "\n".join(md_lines)
 
 
+WORKFORCE_STRATEGY_NOTE = (
+    "No public, no-key API surfaces peer workforce-strategy announcements (AI upskilling "
+    "programs, wellness benefits, RTO mandates, etc.) as structured, fetchable data — this would "
+    "require either a paid news-monitoring API or a manual step, and per current direction this "
+    "tool takes no manual input. Left blank rather than faked. If a specific structured source "
+    "for this becomes available, it can be wired in the same way as the other live sources."
+)
+
+
 def render_workforce_strategy_tab() -> str:
     st.subheader("Workforce & Talent Strategy")
+    st.info(WORKFORCE_STRATEGY_NOTE)
+    return WORKFORCE_STRATEGY_NOTE
+
+
+def render_talent_flow_detail_tab() -> pd.DataFrame:
+    st.subheader("Talent Flow Detail — live, auto-fetched")
     st.caption(
-        "MANUAL-PASTE: no public API surfaces peer workforce-strategy announcements "
-        "(AI upskilling programs, wellness benefits, RTO mandates, etc.) as structured data. "
-        "Paste notes from trade press / press releases below."
+        "Fully automatic: pulls the Executive Moves (Insurance) and Insurance Edge RSS feeds — both "
+        "real, robots.txt-permitted, no key needed — keeps only items mentioning one of the 10 locked "
+        "peer companies, and parses each headline into a row below. No paste, no manual entry. "
+        "These are general global insurance feeds, so an empty table most weeks is the correct, "
+        "honest result — not every week produces news about these specific 10 companies."
     )
-    text = st.text_area(
-        "Workforce & talent strategy notes",
-        value=st.session_state.get("workforce_strategy_text", ""),
-        height=150,
-        key="workforce_strategy_text",
-    )
-    return text
 
+    auto_df, fetch_result = fetch_auto_trade_press_moves()
+    st.caption(f"Retrieved {fetch_result['retrieved_at']} · Source: {fetch_result['source']}")
+    if fetch_result["error"]:
+        st.warning(f"Some feeds failed: {fetch_result['error']}")
 
-def render_trade_press_check() -> None:
-    st.subheader("0. Check trade press (live, filtered to locked peers)")
+    if auto_df.empty:
+        st.info("No mentions of a locked peer company found in the latest feed items this pull.")
+        return auto_df
+
+    st.subheader("Review")
     st.caption(
-        "LIVE: pulls the Executive Moves (Insurance) and Insurance Edge RSS feeds — both real, "
-        "robots.txt-permitted, no key needed — and keeps only items mentioning one of the 10 locked "
-        "peer companies. These are general industry feeds, so most pulls will legitimately return "
-        "zero matches; nothing here is auto-added to the move table — review and paste manually below."
+        "Auto-extracted from live headlines — correct any misclassified cell directly (this is "
+        "review/correction of a live pull, not manual data entry)."
     )
-    if st.button("🔎 Check feeds now"):
-        st.session_state["_trade_press_result"] = cached_fetch_trade_press()
-
-    result = st.session_state.get("_trade_press_result")
-    if result is not None:
-        st.caption(f"Retrieved {result['retrieved_at']} · Source: {result['source']}")
-        if result["error"]:
-            st.warning(f"Some feeds failed: {result['error']}")
-        matches = result["data"]
-        if not matches:
-            st.info("No mentions of a locked peer company found in the latest feed items this pull.")
-        else:
-            for m in matches:
-                st.markdown(f"**{m['title']}** ({', '.join(m['matched_peers'])})")
-                st.caption(f"{m['feed']} · {m['pub_date']} · [{m['link']}]({m['link']})")
-                if st.button(f"Add headline to source text", key=f"add_{m['link']}"):
-                    existing = st.session_state.get("source_text", "")
-                    st.session_state["source_text"] = (existing + "\n" + m["title"]).strip()
-                    st.rerun()
-
-    st.divider()
-
-
-def render_talent_flow_detail_tab() -> pd.DataFrame | None:
-    render_trade_press_check()
-
-    st.subheader("1. Paste source text")
-    st.caption(
-        "MANUAL-PASTE: trade press, press releases, filing excerpts. One move per line/sentence "
-        "works best; multi-clause sentences are also handled."
-    )
-    text = st.text_area(
-        "Source text",
-        value=st.session_state.get("source_text", ""),
-        height=200,
-        key="source_text",
-    )
-
-    if st.button("Parse moves", type="primary", disabled=not text.strip()):
-        st.session_state["parsed_df"] = parse_moves(text)
-
-    df = st.session_state.get("parsed_df")
-    if df is None:
-        st.info("Paste text above and click **Parse moves**, or load the sample text from the sidebar.")
-        return None
-
-    st.subheader("2. Review & correct")
-    st.caption("Edit any misclassified cells directly in the table below.")
-
     edited_df = st.data_editor(
-        df,
+        auto_df,
         use_container_width=True,
         num_rows="dynamic",
         column_config={
@@ -1053,23 +1068,21 @@ def render_talent_flow_detail_tab() -> pd.DataFrame | None:
         },
         key="move_editor",
     )
-    st.session_state["parsed_df"] = edited_df
 
-    if not edited_df.empty:
-        st.subheader("3. So What")
-        sourcing_tab, retention_tab, benchmarking_tab = st.tabs(["Sourcing", "Retention", "Benchmarking"])
-        sourcing_md = build_sourcing_section(edited_df)
-        retention_md = build_retention_section(edited_df)
-        benchmarking_md = build_benchmarking_section(edited_df)
-        with sourcing_tab:
-            st.markdown(sourcing_md)
-        with retention_tab:
-            st.markdown(retention_md)
-        with benchmarking_tab:
-            st.markdown(benchmarking_md)
-        st.session_state["_sourcing_md"] = sourcing_md
-        st.session_state["_retention_md"] = retention_md
-        st.session_state["_benchmarking_md"] = benchmarking_md
+    st.subheader("So What")
+    sourcing_tab, retention_tab, benchmarking_tab = st.tabs(["Sourcing", "Retention", "Benchmarking"])
+    sourcing_md = build_sourcing_section(edited_df)
+    retention_md = build_retention_section(edited_df)
+    benchmarking_md = build_benchmarking_section(edited_df)
+    with sourcing_tab:
+        st.markdown(sourcing_md)
+    with retention_tab:
+        st.markdown(retention_md)
+    with benchmarking_tab:
+        st.markdown(benchmarking_md)
+    st.session_state["_sourcing_md"] = sourcing_md
+    st.session_state["_retention_md"] = retention_md
+    st.session_state["_benchmarking_md"] = benchmarking_md
 
     return edited_df
 
@@ -1082,7 +1095,7 @@ def render_methodology_tab() -> None:
 
 def main() -> None:
     st.title("🧭 Talent Moves Tracker")
-    st.caption("Competitive talent intelligence for Manulife People Analytics — live public data + manual-paste, never blended without a tag.")
+    st.caption("Competitive talent intelligence for Manulife People Analytics — fully live sources, never blended without a tag.")
 
     market, peers = render_sidebar()
 
@@ -1090,7 +1103,7 @@ def main() -> None:
         ["📡 Live Report", "📋 Talent Flow Detail", "📊 Labour-Market Research", "🧭 Workforce & Strategy", "📖 Methodology"]
     )
 
-    moves_df = st.session_state.get("parsed_df")
+    moves_df = None
 
     with detail_tab:
         moves_df = render_talent_flow_detail_tab()
@@ -1109,7 +1122,7 @@ def main() -> None:
 
     st.sidebar.divider()
     st.sidebar.subheader("Export")
-    export_df = moves_df if moves_df is not None else pd.DataFrame(columns=MOVE_COLUMNS)
+    export_df = moves_df if moves_df is not None and not moves_df.empty else pd.DataFrame(columns=MOVE_COLUMNS)
     markdown_report = build_markdown_export(
         market=market,
         flags=flags,
