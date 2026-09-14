@@ -238,27 +238,23 @@ TRADE_PRESS_FEEDS = {
 }
 
 
-def fetch_trade_press_mentions(peer_aliases: dict[str, list[str]], limit_per_feed: int = 20) -> dict:
-    """Fetch each trade-press RSS feed and keep only items mentioning a locked peer.
+def fetch_trade_press_mentions(peer_aliases: dict[str, list[str]] | None = None, limit_per_feed: int = 30) -> dict:
+    """Fetch both trade-press RSS feeds and return EVERY item — industry-wide,
+    not filtered to any peer set. Each item is tagged with `matched_peers`
+    (which locked peers, if any, it mentions — empty list if none) so callers
+    can decide what counts as peer-relevant without the feed silently
+    dropping every other company's real, current executive move.
 
-    peer_aliases: {canonical_peer_name: [alias1, alias2, ...]} — an item is kept
-    if any alias appears (case-insensitive) in its title or description.
-
-    This does NOT auto-add anything to the move table. It surfaces matched
-    items (title, link, pubDate, matched peer, source feed) for a human to
-    review and paste into the manual-paste box — per governance, LLM-free
-    text extraction still requires a human review step before anything is
-    treated as a tracked move.
-
-    General industry feeds like these mostly cover companies outside our
-    locked peer set — that is expected and not a bug; most pulls will
-    legitimately return zero matches.
+    peer_aliases is optional: {canonical_peer_name: [alias1, alias2, ...]}.
+    Pass None/{} to skip peer-tagging and just get every item.
     """
     retrieved_at = _now_iso()
-    all_matches = []
+    all_items = []
     feed_errors = {}
 
-    flat_aliases = [(canonical, alias.lower()) for canonical, aliases in peer_aliases.items() for alias in aliases]
+    flat_aliases = [
+        (canonical, alias.lower()) for canonical, aliases in (peer_aliases or {}).items() for alias in aliases
+    ]
 
     for feed_name, feed_url in TRADE_PRESS_FEEDS.items():
         try:
@@ -279,16 +275,15 @@ def fetch_trade_press_mentions(peer_aliases: dict[str, list[str]], limit_per_fee
                 haystack = f"{title} {description}".lower()
                 matched_peers = sorted({canonical for canonical, alias in flat_aliases if alias in haystack})
 
-                if matched_peers:
-                    all_matches.append(
-                        {
-                            "feed": feed_name,
-                            "title": title,
-                            "link": link,
-                            "pub_date": pubdate,
-                            "matched_peers": matched_peers,
-                        }
-                    )
+                all_items.append(
+                    {
+                        "feed": feed_name,
+                        "title": title,
+                        "link": link,
+                        "pub_date": pubdate,
+                        "matched_peers": matched_peers,
+                    }
+                )
         except (URLError, HTTPError, TimeoutError, _ET.ParseError) as e:
             feed_errors[feed_name] = str(e)
 
@@ -297,7 +292,7 @@ def fetch_trade_press_mentions(peer_aliases: dict[str, list[str]], limit_per_fee
         "retrieved_at": retrieved_at,
         "source": "Trade-press RSS feeds (" + ", ".join(TRADE_PRESS_FEEDS.keys()) + ")",
         "source_url": None,
-        "data": all_matches,
+        "data": all_items,
         "feed_errors": feed_errors,
         "error": "; ".join(f"{k}: {v}" for k, v in feed_errors.items()) if feed_errors else None,
     }

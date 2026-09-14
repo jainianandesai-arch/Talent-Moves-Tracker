@@ -283,6 +283,33 @@ def extract_companies(line: str) -> list[str]:
     return deduped
 
 
+# Verbs where the COMPANY is the grammatical subject ("<Company> appoints <Person>").
+COMPANY_SUBJECT_VERBS = (
+    r"(?i:appoints?|appointed|names?|named|promotes?|promoted|elevates?|elevated|"
+    r"welcomes?|welcomed|hires?|hired|recruits?|recruited)"
+)
+# Verbs where the PERSON is the grammatical subject ("<Person> joins <Company>").
+PERSON_SUBJECT_VERBS = r"(?i:joins?|joined)"
+
+
+def extract_headline_company(line: str) -> str:
+    """Extract the organization name from a headline-style move announcement,
+    for ANY company — not limited to the 10 locked peers. Checks the
+    person-subject shape first ("<Person> joins <Company>") since otherwise
+    the company-subject pattern would wrongly treat the person's name as the
+    company (both patterns can match text that ends in "joins").
+    """
+    m2 = re.search(r"\bjoins?\s+([A-Z][\w&.,'’\-\s]{1,60}?)\s+(?:as\b|,|\.|$)", line)
+    if m2:
+        return m2.group(1).strip()
+
+    m = re.match(r"^([A-Z][\w&.,'’\-\s]{1,60}?)(?:'s)?\s+" + COMPANY_SUBJECT_VERBS + r"\b", line)
+    if m:
+        return m.group(1).strip().rstrip("'").rstrip(",")
+
+    return ""
+
+
 ROLE_WORDS = {
     "head", "chief", "president", "director", "officer", "manager", "vice",
     "senior", "executive", "global", "group", "bank", "financial", "corp",
@@ -467,53 +494,45 @@ MOVE_COLUMNS = [
 ]
 
 
-def parse_moves(text: str, input_method: str = "Manual paste", default_source: str = "") -> pd.DataFrame:
-    """Parse raw text into structured moves.
+def _build_move(line: str, input_method: str, default_source: str) -> Move:
+    """Build a single Move from one already-isolated line/headline. Does NOT
+    split the text further — callers decide what counts as one unit (a
+    multi-sentence paste needs sentence-splitting; a single RSS headline is
+    already one unit and must NOT be re-split, since headlines routinely
+    contain abbreviations like "Robert E. Barlow" that a sentence-boundary
+    splitter would misread as two sentences)."""
+    direction, _ = classify_direction(line)
+    prior_title, new_title = _extract_titles(line)
+    companies = extract_companies(line)
+    person = extract_person(line)
+    move_date = extract_date(line)
+    source = extract_source(line) or default_source
 
-    input_method tags every resulting row (e.g. "Manual paste" or
-    "Auto (Executive Moves)") so the review table always shows where a row
-    came from — auto-fetched rows still need a human glance before they're
-    treated as fact, per governance, but they no longer require re-typing.
-    default_source is used when a line has no inline source attribution of
-    its own (e.g. an RSS headline whose "source" is simply the feed itself).
-    """
-    lines = split_into_candidate_lines(text)
-    moves: list[Move] = []
-
-    for line in lines:
-        direction, _ = classify_direction(line)
-        prior_title, new_title = _extract_titles(line)
-        companies = extract_companies(line)
-        person = extract_person(line)
-        move_date = extract_date(line)
-        source = extract_source(line) or default_source
-
-        prior_company, new_company = "", ""
-        if companies:
-            if direction == "Outbound":
-                prior_company = companies[0]
-            elif direction == "Inbound":
-                new_company = companies[0]
+    prior_company, new_company = "", ""
+    if companies:
+        if direction == "Outbound":
+            prior_company = companies[0]
+        elif direction == "Inbound":
+            new_company = companies[0]
+        else:
+            if len(companies) >= 2:
+                prior_company, new_company = companies[0], companies[1]
             else:
-                if len(companies) >= 2:
-                    prior_company, new_company = companies[0], companies[1]
-                else:
-                    prior_company = new_company = companies[0]
+                prior_company = new_company = companies[0]
 
-        title_delta = classify_title_delta(prior_title, new_title)
-        function = classify_function(new_title or prior_title, line)
+    title_delta = classify_title_delta(prior_title, new_title)
+    function = classify_function(new_title or prior_title, line)
 
-        moves.append(
-            Move(
-                person=person, direction=direction, prior_title=prior_title, new_title=new_title,
-                prior_company=prior_company, new_company=new_company, date=move_date, source=source,
-                title_delta=title_delta, function=function, raw_text=line, input_method=input_method,
-            )
-        )
+    return Move(
+        person=person, direction=direction, prior_title=prior_title, new_title=new_title,
+        prior_company=prior_company, new_company=new_company, date=move_date, source=source,
+        title_delta=title_delta, function=function, raw_text=line, input_method=input_method,
+    )
 
+
+def _moves_to_df(moves: list["Move"]) -> pd.DataFrame:
     if not moves:
         return pd.DataFrame(columns=MOVE_COLUMNS)
-
     return pd.DataFrame(
         [
             {
@@ -527,30 +546,71 @@ def parse_moves(text: str, input_method: str = "Manual paste", default_source: s
     )
 
 
+def parse_single_headline(headline: str, input_method: str = "Manual paste", default_source: str = "") -> pd.DataFrame:
+    """Parse exactly one headline/title into exactly one move row, with no
+    sentence-splitting — use this for RSS headlines and similar single-unit
+    text. See parse_moves for multi-sentence pasted paragraphs."""
+    return _moves_to_df([_build_move(headline.strip(), input_method, default_source)])
+
+
+def parse_moves(text: str, input_method: str = "Manual paste", default_source: str = "") -> pd.DataFrame:
+    """Parse raw (possibly multi-sentence) text into structured moves.
+
+    input_method tags every resulting row (e.g. "Manual paste" or
+    "Auto (Executive Moves)") so the review table always shows where a row
+    came from — auto-fetched rows still need a human glance before they're
+    treated as fact, per governance, but they no longer require re-typing.
+    default_source is used when a line has no inline source attribution of
+    its own (e.g. an RSS headline whose "source" is simply the feed itself).
+    """
+    lines = split_into_candidate_lines(text)
+    moves = [_build_move(line, input_method, default_source) for line in lines]
+    return _moves_to_df(moves)
+
+
 def fetch_auto_trade_press_moves() -> tuple[pd.DataFrame, dict]:
-    """Fetch trade-press RSS feeds live, filter to locked peers, and parse each
-    matched headline into a structured move row automatically — no paste step.
+    """Fetch both trade-press RSS feeds live and parse EVERY item into a
+    structured move row automatically — industry-wide, any company, not
+    restricted to the 10 locked peers or to a country. No paste step.
+
+    Company is extracted generically (extract_headline_company) so a real,
+    current move at any insurance-industry company shows up, not just the
+    rare item that happens to name one of our 10 peers. A "Matched Locked
+    Peer" column still flags rows relevant to our peer set specifically, for
+    the Live Report tab to filter on — but nothing is hidden from this table.
 
     Every row is tagged Input Method = "Auto (<feed name>)" and Source = the
-    article link, so it's still clear this came from an unreviewed live pull,
-    not a human-confirmed paste. Returns (moves_df, raw_fetch_result) so the
-    UI can show the raw fetch result (timestamp, errors) alongside the table.
+    article link. Returns (moves_df, raw_fetch_result).
     """
     result = cached_fetch_trade_press()
     frames = []
-    for match in result["data"]:
-        row_df = parse_moves(
-            match["title"],
-            input_method=f"Auto ({match['feed']})",
-            default_source=match["link"],
-        )
-        if not row_df.empty:
-            if not row_df.at[0, "Date"]:
-                row_df.at[0, "Date"] = match["pub_date"]
-            frames.append(row_df)
+    for item in result["data"]:
+        title = item["title"]
+        row_df = parse_single_headline(title, input_method=f"Auto ({item['feed']})", default_source=item["link"])
+        if row_df.empty or row_df.at[0, "Direction"] == "Unclassified":
+            # Unclassified means no hiring/departure/promotion verb was found at
+            # all — almost always a non-personnel story (deals, research, events)
+            # rather than a genuine move with low-confidence classification, so
+            # it's dropped here rather than shown as a move.
+            continue
 
+        company = extract_headline_company(title)
+        direction = row_df.at[0, "Direction"]
+        if company:
+            if direction == "Outbound":
+                row_df.at[0, "Prior Company"] = company
+            else:
+                row_df.at[0, "New Company"] = company
+
+        if not row_df.at[0, "Date"]:
+            row_df.at[0, "Date"] = item["pub_date"]
+        row_df["Matched Locked Peer"] = ", ".join(item["matched_peers"])
+        row_df["Feed"] = item["feed"]
+        frames.append(row_df)
+
+    out_columns = MOVE_COLUMNS + ["Matched Locked Peer", "Feed"]
     if not frames:
-        return pd.DataFrame(columns=MOVE_COLUMNS), result
+        return pd.DataFrame(columns=out_columns), result
     return pd.concat(frames, ignore_index=True), result
 
 
@@ -686,10 +746,8 @@ def compute_company_flag(peer: str, moves_df: pd.DataFrame | None, sec_result: d
     notes = []
     flag = FLAG_GRAY
 
-    if moves_df is not None and not moves_df.empty:
-        peer_moves = moves_df[
-            (moves_df["Prior Company"] == peer) | (moves_df["New Company"] == peer)
-        ]
+    if moves_df is not None and not moves_df.empty and "Matched Locked Peer" in moves_df.columns:
+        peer_moves = moves_df[moves_df["Matched Locked Peer"].fillna("").str.contains(peer, regex=False)]
         if not peer_moves.empty:
             outbound_n = (peer_moves["Direction"] == "Outbound").sum()
             inbound_n = (peer_moves["Direction"] == "Inbound").sum()
@@ -1034,13 +1092,14 @@ def render_workforce_strategy_tab() -> str:
 
 
 def render_talent_flow_detail_tab() -> pd.DataFrame:
-    st.subheader("Talent Flow Detail — live, auto-fetched")
+    st.subheader("Talent Flow Detail — live, industry-wide")
     st.caption(
-        "Fully automatic: pulls the Executive Moves (Insurance) and Insurance Edge RSS feeds — both "
-        "real, robots.txt-permitted, no key needed — keeps only items mentioning one of the 10 locked "
-        "peer companies, and parses each headline into a row below. No paste, no manual entry. "
-        "These are general global insurance feeds, so an empty table most weeks is the correct, "
-        "honest result — not every week produces news about these specific 10 companies."
+        "Fully automatic: pulls every item from the Executive Moves (Insurance) and Insurance Edge "
+        "RSS feeds — both real, robots.txt-permitted, no key needed — and parses each headline into "
+        "a row below. Not restricted to the 10 locked peers or to a country: this shows every "
+        "executive move either feed reports across the insurance industry. The **Matched Locked "
+        "Peer** column flags rows relevant to our specific peer set — used by the Live Report tab — "
+        "but nothing here is hidden or filtered out. No paste, no manual entry."
     )
 
     auto_df, fetch_result = fetch_auto_trade_press_moves()
@@ -1049,8 +1108,11 @@ def render_talent_flow_detail_tab() -> pd.DataFrame:
         st.warning(f"Some feeds failed: {fetch_result['error']}")
 
     if auto_df.empty:
-        st.info("No mentions of a locked peer company found in the latest feed items this pull.")
+        st.info("Both feeds returned no parseable move headlines this pull.")
         return auto_df
+
+    matched_count = (auto_df["Matched Locked Peer"] != "").sum()
+    st.caption(f"{len(auto_df)} move(s) fetched this pull · {matched_count} match a locked peer.")
 
     st.subheader("Review")
     st.caption(
