@@ -21,13 +21,39 @@ bot-blocked), so nobody re-attempts the same dead end blind.
 """
 
 import datetime as dt
+import os
 import re
 from dataclasses import dataclass
 
+import anthropic
 import pandas as pd
 import streamlit as st
 
 import live_sources
+
+CLAUDE_MODEL = "claude-sonnet-4-5"
+CLAUDE_WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_uses": 3}
+
+ASK_SYSTEM_PROMPT = """You are a research assistant for Manulife's People Analytics team, answering \
+ad-hoc questions about competitive talent movement among a locked set of insurance peers (Canada: Sun \
+Life, Canada Life, RBC Insurance, iA Financial Group, Empire Life; US: John Hancock, MetLife, Prudential \
+Financial, Lincoln Financial, Principal Financial).
+
+You will be given LIVE DATA CONTEXT below, pulled moments ago from real sources (SEC EDGAR filings, \
+StatCan/BLS labour data, and trade-press RSS headlines). Rules:
+- Prefer answering from the given context and cite it (name the source, e.g. "per SEC EDGAR" or "per \
+Executive Moves").
+- Only use the web_search tool if the context doesn't cover the question, or the user is asking about \
+something clearly outside this session's live pull (e.g. a different company, older news, or a broader \
+industry question).
+- Never fabricate a specific person, title, or date. If you don't have it and can't find it, say so \
+plainly rather than guessing.
+- Distinguish clearly between what's a "Disclosed fact" (from a named filing/article) and any inference \
+you're making on top of it.
+- Keep answers concise and structured — this is an analyst tool, not a chat companion.
+- This tool does not track or infer anything about non-executive/individual employees; keep answers \
+scoped to publicly disclosed leadership moves and labour-market data.
+"""
 
 st.set_page_config(
     page_title="Talent Moves Tracker",
@@ -1040,10 +1066,8 @@ def render_live_report_tab(market: str, peers: list[str], moves_df: pd.DataFrame
     return flags, bottom_line, market
 
 
-def render_labour_market_tab(market: str) -> str:
-    st.subheader("Labour-Market Research (live)")
-
-    if market == "Canada":
+def _render_labour_market_country(country: str) -> str:
+    if country == "Canada":
         result = cached_fetch_statcan()
         source_label = "Statistics Canada — Labour Force Survey (WDS API)"
     else:
@@ -1069,11 +1093,25 @@ def render_labour_market_tab(market: str) -> str:
         else:
             st.caption("No data points returned.")
 
-    st.info(live_sources.JOB_BANK_NOTE)
-    st.caption(live_sources.ADZUNA_NOTE)
-    md_lines.append(f"_Note: {live_sources.JOB_BANK_NOTE}_")
+    if country == "Canada":
+        st.info(live_sources.JOB_BANK_NOTE)
+        st.caption(live_sources.ADZUNA_NOTE)
+        md_lines.append(f"_Note: {live_sources.JOB_BANK_NOTE}_")
 
     return "\n".join(md_lines)
+
+
+def render_labour_market_tab(market: str) -> str:
+    st.subheader("Labour-Market Research (live)")
+    st.caption("Independent of the peer market selected in the sidebar — pick a country to view here.")
+
+    ca_tab, us_tab = st.tabs(["🇨🇦 Canada", "🇺🇸 US"])
+    with ca_tab:
+        canada_md = _render_labour_market_country("Canada")
+    with us_tab:
+        us_md = _render_labour_market_country("US")
+
+    return canada_md if market == "Canada" else us_md
 
 
 WORKFORCE_STRATEGY_NOTE = (
@@ -1149,6 +1187,118 @@ def render_talent_flow_detail_tab() -> pd.DataFrame:
     return edited_df
 
 
+def get_claude_client() -> anthropic.Anthropic | None:
+    api_key = None
+    try:
+        api_key = st.secrets.get("ANTHROPIC_API_KEY")
+    except Exception:
+        pass
+    api_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    return anthropic.Anthropic(api_key=api_key)
+
+
+def build_ask_context(market: str, moves_df: pd.DataFrame | None) -> str:
+    """Assemble a compact text snapshot of everything this session has already
+    fetched live, so the model answers from real, retrieved data first and
+    only reaches for web_search when the context genuinely doesn't cover it."""
+    parts = [f"Current market selected in the app: {market}"]
+
+    if moves_df is not None and not moves_df.empty:
+        parts.append("\nLIVE TRADE-PRESS MOVES FETCHED THIS SESSION (industry-wide, from Executive Moves / Insurance Edge RSS):")
+        cols = ["Person", "Direction", "Prior Company", "New Company", "New Title", "Function", "Matched Locked Peer", "Date", "Source"]
+        for _, row in moves_df.iterrows():
+            parts.append(" - " + " | ".join(f"{c}: {row.get(c, '')}" for c in cols if row.get(c, "")))
+    else:
+        parts.append("\nNo trade-press moves were fetched this session (feeds returned nothing parseable).")
+
+    if market == "US":
+        parts.append("\nSEC EDGAR — recent filings for US peers:")
+        for peer in LOCKED_PEER_SETS["US"]:
+            result = cached_fetch_sec(peer)
+            if result["ok"] and result["data"]:
+                latest = result["data"][0]
+                parts.append(f" - {peer}: most recent {latest['form']} filed {latest['filed']} ({latest['url']})")
+            elif result["ok"]:
+                parts.append(f" - {peer}: no recent 8-K/10-K/DEF 14A on file")
+            else:
+                parts.append(f" - {peer}: SEC lookup unavailable ({result['error']})")
+        macro = cached_fetch_bls()
+    else:
+        macro = cached_fetch_statcan()
+
+    if macro["ok"]:
+        parts.append(f"\nLabour-market data (retrieved {macro['retrieved_at']}):")
+        for label, points in macro["data"].items():
+            if points:
+                latest = points[0]
+                parts.append(f" - {label}: {latest['value']} ({latest['period']})")
+
+    return "\n".join(parts)
+
+
+def render_ask_tab(market: str, moves_df: pd.DataFrame | None) -> None:
+    st.subheader("Ask")
+    st.caption(
+        "Natural-language questions about talent movement, answered by Claude. Grounded first in the "
+        "live data already fetched this session (shown in the other tabs); falls back to a live web "
+        "search only when that doesn't cover the question. Uses the Anthropic API — each question has "
+        "a real cost."
+    )
+
+    client = get_claude_client()
+    if client is None:
+        st.warning(
+            "No Anthropic API key configured. Add `ANTHROPIC_API_KEY` in Streamlit Cloud under "
+            "**Settings → Secrets** (or a local `.streamlit/secrets.toml`) to enable this tab."
+        )
+        return
+
+    if "ask_history" not in st.session_state:
+        st.session_state["ask_history"] = []
+
+    for msg in st.session_state["ask_history"]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+
+    question = st.chat_input("e.g. \"What's the latest at MetLife?\" or \"Any actuarial leadership moves this month?\"")
+    if not question:
+        return
+
+    st.session_state["ask_history"].append({"role": "user", "content": question})
+    with st.chat_message("user"):
+        st.markdown(question)
+
+    context = build_ask_context(market, moves_df)
+
+    with st.chat_message("assistant"):
+        placeholder = st.empty()
+        placeholder.markdown("Thinking...")
+        try:
+            response = client.messages.create(
+                model=CLAUDE_MODEL,
+                max_tokens=1200,
+                system=ASK_SYSTEM_PROMPT,
+                tools=[CLAUDE_WEB_SEARCH_TOOL],
+                messages=[
+                    {"role": "user", "content": f"LIVE DATA CONTEXT:\n{context}\n\nQUESTION: {question}"}
+                ],
+            )
+        except anthropic.APIError as e:
+            placeholder.error(f"API error: {e}")
+            st.session_state["ask_history"].pop()
+            return
+
+        answer_text = "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
+        placeholder.markdown(answer_text)
+
+        usage = response.usage
+        st.caption(f"{usage.input_tokens:,} input / {usage.output_tokens:,} output tokens this query")
+
+    st.session_state["ask_history"].append({"role": "assistant", "content": answer_text})
+
+
 def render_methodology_tab() -> None:
     st.subheader("Methodology & Governance")
     with st.expander("Full governance & methodology note", expanded=True):
@@ -1161,8 +1311,8 @@ def main() -> None:
 
     market, peers = render_sidebar()
 
-    live_tab, detail_tab, labour_tab, strategy_tab, methodology_tab = st.tabs(
-        ["📡 Live Report", "📋 Talent Flow Detail", "📊 Labour-Market Research", "🧭 Workforce & Strategy", "📖 Methodology"]
+    live_tab, detail_tab, labour_tab, strategy_tab, ask_tab, methodology_tab = st.tabs(
+        ["📡 Live Report", "📋 Talent Flow Detail", "📊 Labour-Market Research", "🧭 Workforce & Strategy", "💬 Ask", "📖 Methodology"]
     )
 
     moves_df = None
@@ -1178,6 +1328,9 @@ def main() -> None:
 
     with strategy_tab:
         workforce_strategy_text = render_workforce_strategy_tab()
+
+    with ask_tab:
+        render_ask_tab(market, moves_df)
 
     with methodology_tab:
         render_methodology_tab()

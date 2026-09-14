@@ -301,8 +301,8 @@ def fetch_trade_press_mentions(peer_aliases: dict[str, list[str]] | None = None,
 JOB_BANK_NOTE = (
     "Job Bank Canada's open-data postings file has no employer-name field — it can only "
     "answer national/NOC-level questions (e.g. 'how many actuarial postings exist in Canada "
-    "this month'), not company-specific ones. Company-level posting counts must come from "
-    "manually pasting counts observed on each peer's own career page."
+    "this month'), not company-specific ones. Company-level posting counts are not available "
+    "in this tool — career pages are bot-blocked and no other free API surfaces them."
 )
 
 ADZUNA_NOTE = (
