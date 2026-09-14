@@ -1,19 +1,31 @@
 """
 Talent Moves Tracker
 ---------------------
-A rule-based (no LLM/API dependency) Streamlit tool that extracts personnel/executive
-moves from pasted source text (press releases, news snippets, LinkedIn-style
-announcements copied by hand, etc.), classifies each move, and produces a
-human-reviewable table plus a "So What" analysis, exportable to Markdown.
+Competitive talent-intelligence tool for Manulife People Analytics.
 
-Single-file app: parsing, classification, UI, and export all live here.
+Two input paths feed every report:
+  1. LIVE, no-key public APIs (StatCan WDS, BLS, SEC EDGAR) — wired directly,
+     cached, every value carries a source + retrieval timestamp.
+  2. MANUAL-PASTE — rule-based text extraction (no LLM) for sources with no
+     usable public API (trade press, career pages, SEDAR+, WARN notices).
+
+Every section of the UI is labeled with which path it's on. Nothing here
+blends a "Disclosed fact" (from a named filing/press release) with an
+"Inferred signal" (a pattern we noticed) without saying which is which.
+
+See live_sources.py for the API fetch functions and a record of which
+candidate sources were tested and rejected (no employer field, no free key,
+bot-blocked), so nobody re-attempts the same dead end blind.
 """
 
+import datetime as dt
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import pandas as pd
 import streamlit as st
+
+import live_sources
 
 st.set_page_config(
     page_title="Talent Moves Tracker",
@@ -22,44 +34,55 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+HOME_COMPANY = "Manulife"
+
 # ---------------------------------------------------------------------------
-# Peer sets (used for Direction classification + Benchmarking)
+# LOCKED peer set — do not change without asking (per governance decision).
+# Two separate markets; reports never merge them into one list.
 # ---------------------------------------------------------------------------
 
-PEER_SETS = {
-    "Canada": [
-        "RBC", "Royal Bank of Canada", "TD", "TD Bank", "Toronto-Dominion",
-        "Scotiabank", "Bank of Nova Scotia", "BMO", "Bank of Montreal",
-        "CIBC", "Canadian Imperial Bank of Commerce", "National Bank",
-        "National Bank of Canada", "Manulife", "Sun Life", "Sun Life Financial",
-        "Great-West Life", "Great-West Lifeco", "iA Financial", "Desjardins",
-        "CPPIB", "CPP Investments", "OTPP", "Ontario Teachers' Pension Plan",
-        "OMERS", "CDPQ", "Caisse de dépôt", "PSP Investments", "Brookfield",
-        "Fairfax", "Fairfax Financial", "Power Corporation", "IGM Financial",
-    ],
-    "US": [
-        "JPMorgan", "JPMorgan Chase", "J.P. Morgan", "Bank of America", "BofA",
-        "Citigroup", "Citi", "Wells Fargo", "Goldman Sachs", "Morgan Stanley",
-        "US Bank", "U.S. Bank", "PNC", "PNC Financial", "Truist",
-        "Capital One", "American Express", "Amex", "BlackRock", "State Street",
-        "Charles Schwab", "Fidelity", "Vanguard", "MetLife", "Prudential",
-        "Prudential Financial", "AIG", "Berkshire Hathaway",
-    ],
+LOCKED_PEER_SETS: dict[str, list[str]] = {
+    "Canada": ["Sun Life", "Canada Life", "RBC Insurance", "iA Financial Group", "Empire Life"],
+    "US": ["John Hancock", "MetLife", "Prudential Financial", "Lincoln Financial", "Principal Financial"],
 }
 
-# Flattened company/organization list used by extract_companies / extract_person.
-ALL_KNOWN_COMPANIES = sorted(set(PEER_SETS["Canada"] + PEER_SETS["US"]), key=len, reverse=True)
+# Aliases used only for text-matching in pasted content (extract_companies),
+# not for changing the locked peer list itself.
+COMPANY_ALIASES: dict[str, list[str]] = {
+    "Sun Life": ["Sun Life", "Sun Life Financial"],
+    "Canada Life": ["Canada Life", "Great-West Lifeco", "Great-West Life", "GWL"],
+    "RBC Insurance": ["RBC Insurance", "RBC"],
+    "iA Financial Group": ["iA Financial Group", "iA Financial", "Industrial Alliance"],
+    "Empire Life": ["Empire Life"],
+    "John Hancock": ["John Hancock"],
+    "MetLife": ["MetLife"],
+    "Prudential Financial": ["Prudential Financial", "Prudential"],
+    "Lincoln Financial": ["Lincoln Financial", "Lincoln National"],
+    "Principal Financial": ["Principal Financial", "Principal Financial Group"],
+    HOME_COMPANY: ["Manulife", "Manulife Financial"],
+}
+
+ALL_KNOWN_COMPANIES = sorted(
+    {alias for aliases in COMPANY_ALIASES.values() for alias in aliases}, key=len, reverse=True
+)
+
+
+def canonical_company(matched_alias: str) -> str:
+    for canonical, aliases in COMPANY_ALIASES.items():
+        if matched_alias.lower() in {a.lower() for a in aliases}:
+            return canonical
+    return matched_alias
+
 
 # ---------------------------------------------------------------------------
 # Vocabulary for title-seniority and function classification
 # ---------------------------------------------------------------------------
 
-# Seniority ranks — higher number = more senior. Used for Title Delta (Promotion vs Lateral).
 SENIORITY_RANK = [
     (100, [r"\bchief executive officer\b", r"\bceo\b", r"\bpresident and ceo\b"]),
     (95, [r"\bpresident\b(?!.{0,20}vice)"]),
     (90, [r"\bvice[\s-]?chair\b", r"\bexecutive vice[\s-]?chair\b"]),
-    (85, [r"\bchief\s+\w[\w\s&/]*\s+officer\b", r"\bc[a-z]o\b"]),  # Chief X Officer / CFO/CRO/etc.
+    (85, [r"\bchief\s+\w[\w\s&/]*\s+officer\b", r"\bc[a-z]o\b"]),
     (80, [r"\bgroup head\b", r"\bhead of group\b"]),
     (75, [r"\bexecutive vice president\b", r"\bevp\b"]),
     (70, [r"\bglobal head\b"]),
@@ -75,16 +98,20 @@ SENIORITY_RANK = [
     (10, [r"\banalyst\b"]),
 ]
 
-# Scope-breadth signals (used to distinguish "Expanded Remit" from a flat Lateral
-# when seniority rank is roughly equal but the new title covers more ground).
 SCOPE_EXPANSION_PATTERNS = [
     r"\bglobal\b", r"\bworldwide\b", r"\benterprise[\s-]?wide\b", r"\ball[\s-]?markets\b",
     r"\bnorth america\b", r"\binternational\b", r"\bgroup[\s-]?wide\b",
-    r"\band\b.{0,40}\b(chief|head|officer)\b",  # "X and Y" combined mandate
+    r"\band\b.{0,40}\b(chief|head|officer)\b",
 ]
 SCOPE_NARROWING_HINTS = [r"\binterim\b", r"\bacting\b"]
 
+# Provisional role-family tags — NOT a fixed taxonomy per governance rule 4.
+# This keyword map is a placeholder used only until enough real postings/moves
+# accumulate to justify grouping by NOC (Canada) / O*NET-SOC (US) codes on
+# Manulife's own current postings. Treat "Function" values below as rough,
+# interim labels, not a settled schema.
 FUNCTION_KEYWORDS = {
+    "Actuarial": ["actuary", "actuarial", "fsa", "fcia", "asa"],
     "Risk": [
         "risk", "credit risk", "market risk", "operational risk", "compliance",
         "chief risk officer", "cro", "internal audit", "audit", "regulatory affairs",
@@ -122,7 +149,7 @@ FUNCTION_KEYWORDS = {
 }
 
 # ---------------------------------------------------------------------------
-# Direction classification vocabulary
+# Direction vocabulary
 # ---------------------------------------------------------------------------
 
 INBOUND_VERBS = [
@@ -164,49 +191,36 @@ SOURCE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# ---------------------------------------------------------------------------
-# Sample text for self-testing
-# ---------------------------------------------------------------------------
-
 SAMPLE_TEXT = """
-Jane Smith joins RBC as Chief Risk Officer, effective March 1, 2025, according to an internal memo.
-John Doe, previously Senior Vice President of Technology at TD, has left the bank after eight years; he departed on Feb 14, 2025 (per LinkedIn).
-BMO promoted Maria Chen from Director, Compliance to Head of Compliance, expanding her mandate to cover the US and Canadian businesses, effective Jan 15, 2025.
-Scotiabank named David Lee as its new Chief Financial Officer, succeeding the retiring Anne White, according to a company press release dated 2025-01-10.
-CIBC's Head of Marketing, Priya Nair, is leaving to join a fintech startup, sources say.
-Wells Fargo appointed Robert King as Executive Vice President, Global Technology, per a statement issued April 2025.
-Sarah Johnson steps down as Chief Operating Officer of Manulife after a decade in the role; the company has not named a successor (Reuters).
-National Bank elevated Marc Tremblay to Senior Director, Risk Management from Manager, Credit Risk, internal promotion announced Q2 2025.
-Citigroup's General Counsel, Laura Bennett, resigned effective June 30, 2025, to pursue an opportunity outside the firm.
-Kevin Wu joined Goldman Sachs as Managing Director, Data & Analytics after five years at a Canadian pension fund, effective May 2025 (company announcement).
+Sun Life named Priya Anand as Chief Actuary, effective March 1, 2026, according to a company press release.
+John Hancock's Head of Technology, Marcus Wei, has left the firm after six years; he departed on Feb 14, 2026 (Insurance Business).
+Canada Life promoted Fatima Khan from Director, Compliance to Head of Compliance, expanding her mandate to cover the US and Canadian businesses, effective Jan 15, 2026 (People Matters).
+Prudential Financial named Robert Ellis as its new Chief Financial Officer, succeeding the retiring Anne Ostrander, according to a company press release dated 2026-01-10.
+RBC Insurance's Head of Marketing, Sarah Cole, is leaving to join a fintech startup, according to MarketScreener.
+Principal Financial appointed David Nguyen as Executive Vice President, Global Technology, per a statement issued April 2026.
+Empire Life's Chief Operating Officer, Michael Turner, steps down after a decade in the role; the company has not named a successor (InsuranceNewsNet).
+iA Financial Group elevated Marc Bouchard to Senior Director, Risk Management from Manager, Credit Risk, internal promotion announced Q2 2026 (Executive Moves).
+Lincoln Financial's General Counsel, Laura Bennett, resigned effective June 30, 2026, to pursue an opportunity outside the firm.
+MetLife hired Kevin Osei as Managing Director, Data & Analytics after five years at a Canadian pension fund, effective May 2026 (company announcement).
 """
 
 # ---------------------------------------------------------------------------
-# Parsing helpers
+# Parsing
 # ---------------------------------------------------------------------------
 
 
 def split_into_candidate_lines(text: str) -> list[str]:
-    """Split raw pasted text into candidate move statements.
-
-    Splits on newlines first, then further splits any long line on sentence
-    boundaries so that multiple moves reported in one paragraph (or one
-    sentence per move) both work.
-    """
     if not text or not text.strip():
         return []
-
     lines: list[str] = []
     for raw_line in text.splitlines():
         raw_line = raw_line.strip()
         if not raw_line:
             continue
-        # Split on sentence-ending punctuation followed by a capital letter,
-        # but avoid splitting on abbreviations like "Inc." or "U.S."
         sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z])", raw_line)
         for s in sentences:
             s = s.strip(" -•\t")
-            if len(s) > 15:  # skip stray fragments/headers
+            if len(s) > 15:
                 lines.append(s)
     return lines
 
@@ -219,57 +233,34 @@ def _find_verb_hit(text_lower: str, verbs: list[str]) -> str | None:
 
 
 def classify_direction(line: str) -> tuple[str, str | None]:
-    """Classify a candidate line as Inbound / Internal / Outbound / Unclassified.
-
-    Returns (direction, matched_verb). Uses a scored/prioritized approach so
-    multi-clause sentences (e.g. "X leaves A to join B", "promoted from Y to Z")
-    still resolve correctly instead of defaulting to Unclassified.
-    """
     text_lower = line.lower()
-
     inbound_hit = _find_verb_hit(text_lower, INBOUND_VERBS)
     outbound_hit = _find_verb_hit(text_lower, OUTBOUND_VERBS)
     internal_hit = _find_verb_hit(text_lower, INTERNAL_VERBS)
 
-    # Compound sentence: "X leaves/departs A to join/joins B" -> Outbound is the
-    # newsworthy direction from the reporting company's point of view UNLESS the
-    # sentence structure signals the move is framed as joining a new employer
-    # (i.e. "leaving to join" reads as that person's Inbound move to company B).
     if outbound_hit and re.search(r"\bto\s+(join|become|take|lead)\b", text_lower):
         return "Inbound", outbound_hit + " ... to join"
 
     if inbound_hit and outbound_hit:
-        # e.g. "after leaving X, joins Y" — prioritize the inbound clause since
-        # that's the actionable/most recent state.
         inbound_pos = text_lower.find(inbound_hit)
         outbound_pos = text_lower.find(outbound_hit)
         return ("Inbound", inbound_hit) if inbound_pos <= outbound_pos else ("Outbound", outbound_hit)
 
     if internal_hit:
         return "Internal", internal_hit
-
     if inbound_hit:
         return "Inbound", inbound_hit
-
     if outbound_hit:
         return "Outbound", outbound_hit
 
-    # --- Fallback heuristics for messy/multi-clause sentences with no direct verb hit ---
-
-    # "from X to Y" pattern strongly suggests an internal move/promotion, even
-    # without one of our INTERNAL_VERBS present (e.g. "X: Director to VP").
     if re.search(r"\bfrom\b.{3,60}\bto\b", text_lower) and re.search(r"\b(role|title|position)\b", text_lower):
         return "Internal", "from...to (role change)"
 
-    # "named/appointed as successor to" / "succeeds" style without a verb hit already
-    # covered above, but catch "X becomes Y" as an internal/inbound signal depending
-    # on whether a prior employer for this same company is mentioned.
     if re.search(r"\bbecomes\b", text_lower):
         if re.search(r"\bat\b|\bwithin\b|\binternal(ly)?\b", text_lower):
             return "Internal", "becomes (internal)"
         return "Inbound", "becomes"
 
-    # Two organizations mentioned with a clear switch preposition ("from ... at").
     companies_found = extract_companies(line)
     if len(companies_found) >= 1 and re.search(r"\bnew\b.{0,15}\b(role|position|title)\b", text_lower):
         return "Inbound", "new role (fallback)"
@@ -278,18 +269,14 @@ def classify_direction(line: str) -> tuple[str, str | None]:
 
 
 def extract_companies(line: str) -> list[str]:
-    """Find known peer-set company names mentioned in the line, longest match first."""
     found = []
-    remaining = line
     for company in ALL_KNOWN_COMPANIES:
         pattern = r"\b" + re.escape(company) + r"\b"
-        if re.search(pattern, remaining, re.IGNORECASE):
-            found.append(company)
-    # De-duplicate near-aliases (e.g. both "TD" and "TD Bank" matching) by keeping
-    # only the longest match per rough prefix cluster.
+        if re.search(pattern, line, re.IGNORECASE):
+            found.append(canonical_company(company))
     deduped: list[str] = []
-    for c in sorted(found, key=len, reverse=True):
-        if not any(c.lower() in d.lower() for d in deduped):
+    for c in found:
+        if c not in deduped:
             deduped.append(c)
     return deduped
 
@@ -298,12 +285,11 @@ ROLE_WORDS = {
     "head", "chief", "president", "director", "officer", "manager", "vice",
     "senior", "executive", "global", "group", "bank", "financial", "corp",
     "corporation", "inc", "the", "board", "committee", "general", "counsel",
+    "life", "insurance", "hancock",
 }
 
 
 def _looks_like_person_name(candidate: str) -> bool:
-    """Reject candidates that are clearly a company name, a title/role phrase,
-    or a possessive company reference rather than an actual person."""
     if not candidate:
         return False
     words = candidate.split()
@@ -320,20 +306,8 @@ def _looks_like_person_name(candidate: str) -> bool:
 
 
 def extract_person(line: str) -> str:
-    """Best-effort extraction of the person's name.
-
-    Tries, in priority order: (1) a name set off by commas in an appositive
-    clause (e.g. "CIBC's Head of Marketing, Priya Nair, is leaving"), (2) a
-    name following a hiring/promotion verb (handles past tense too), (3) a
-    capitalized sequence at the very start of the sentence — but only if it
-    doesn't look like a company or title/role phrase.
-    """
-    # (1) Verb-based, covering base/plural/past-tense forms — checked first since
-    # it's the most reliable signal when present (avoids appositive commas
-    # elsewhere in the sentence, e.g. "Manager, Credit Risk," being mistaken
-    # for a name).
     match = re.search(
-        r"\b(?:appoints?|appointed|names?|named|promotes?|promoted|elevates?|elevated|"
+        r"\b(?i:appoints?|appointed|names?|named|promotes?|promoted|elevates?|elevated|"
         r"welcomes?|welcomed|hires?|hired|recruits?|recruited)\s+"
         r"([A-Z][a-zA-Z.\'-]+(?:\s+[A-Z][a-zA-Z.\'-]+){1,3})",
         line,
@@ -343,17 +317,14 @@ def extract_person(line: str) -> str:
         if _looks_like_person_name(candidate):
             return candidate
 
-    # (2) Appositive: ", Name Name," or ", Name Name Name,"
     for match in re.finditer(r",\s*([A-Z][a-zA-Z.\'-]+(?:\s+[A-Z][a-zA-Z.\'-]+){1,2})\s*,", line):
         candidate = match.group(1).strip()
         if _looks_like_person_name(candidate):
             return candidate
 
-    # (3) Leading capitalized sequence at the start of the sentence.
     match = re.match(r"^([A-Z][a-zA-Z.\'-]+(?:\s+[A-Z][a-zA-Z.\'-]+){1,3})", line.strip())
     if match:
         candidate = match.group(1).strip()
-        # Trim trailing company names accidentally captured (e.g. "Jane Smith RBC").
         for company in ALL_KNOWN_COMPANIES:
             candidate = re.sub(r"\s+" + re.escape(company) + r"$", "", candidate, flags=re.IGNORECASE)
         candidate = candidate.strip()
@@ -376,12 +347,6 @@ def extract_source(line: str) -> str:
 
 
 def _extract_titles(line: str) -> tuple[str, str]:
-    """Best-effort extraction of (prior_title, new_title) from a line.
-
-    Looks for patterns like "from X to Y", "X to Y", "as <title>", or a single
-    title following an action verb (treated as the new title, prior left blank).
-    """
-    # Pattern: "from <prior title> to <new title>"
     m = re.search(
         r"from\s+([A-Z][\w,&/\s-]{2,60}?)\s+to\s+([A-Z][\w,&/\s-]{2,60}?)(?:[,.;]|\s+(?:at|effective|after|since|starting)\b|$)",
         line,
@@ -389,9 +354,6 @@ def _extract_titles(line: str) -> tuple[str, str]:
     if m:
         return m.group(1).strip(), m.group(2).strip()
 
-    # Pattern: "previously <title> at/of <company>, ... (now) <title>" is hard to
-    # generalize; fall back to "as <title>" for the new title and "previously <title>"
-    # for prior.
     new_title = ""
     prior_title = ""
 
@@ -411,8 +373,6 @@ def _extract_titles(line: str) -> tuple[str, str]:
         prior_title = m_prior.group(1).strip()
 
     if not new_title:
-        # "X, <Title> of/at <Company>," near the start — treat as prior title if
-        # verb suggests departure, else new title.
         m_generic = re.search(r",\s*([A-Z][\w,&/\s-]{2,60}?)\s+(?:of|at)\s+[A-Z]", line)
         if m_generic:
             title_guess = m_generic.group(1).strip()
@@ -430,16 +390,13 @@ def _seniority_score(title: str) -> int:
         for p in patterns:
             if re.search(p, title_lower):
                 return rank
-    return 0  # unknown title text
+    return 0
 
 
 def classify_title_delta(prior_title: str, new_title: str) -> str:
-    """Infer Promotion / Lateral / Expanded Remit from prior vs new title text."""
     if not new_title:
         return ""
     if not prior_title:
-        # No prior title to compare — can't confidently call it a promotion;
-        # default to Lateral unless the new title itself signals broadened scope.
         if any(re.search(p, new_title.lower()) for p in SCOPE_EXPANSION_PATTERNS):
             return "Expanded Remit"
         return "Lateral"
@@ -458,16 +415,12 @@ def classify_title_delta(prior_title: str, new_title: str) -> str:
             return "Expanded Remit"
         return "Lateral"
 
-    # new_rank < prior_rank: could still be an expanded remit at a nominally
-    # lower-ranked label (rare) — otherwise call it Lateral rather than a
-    # (likely mis-parsed) demotion, since we don't have a Demotion category.
     if scope_expanded:
         return "Expanded Remit"
     return "Lateral"
 
 
 def classify_function(title: str, full_line: str = "") -> str:
-    """Infer a role-family tag from the title text (falls back to full line)."""
     search_text = f"{title} {full_line}".lower()
     scores = {}
     for func, keywords in FUNCTION_KEYWORDS.items():
@@ -477,11 +430,6 @@ def classify_function(title: str, full_line: str = "") -> str:
     if not scores:
         return "Other"
     return max(scores, key=scores.get)
-
-
-# ---------------------------------------------------------------------------
-# Move dataclass + top-level parse
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -499,11 +447,15 @@ class Move:
     raw_text: str = ""
 
 
-def parse_moves(text: str, peer_set_name: str = "Canada") -> pd.DataFrame:
+MOVE_COLUMNS = [
+    "Person", "Direction", "Prior Title", "New Title", "Prior Company",
+    "New Company", "Date", "Source", "Title Delta", "Function", "Raw Text",
+]
+
+
+def parse_moves(text: str) -> pd.DataFrame:
     lines = split_into_candidate_lines(text)
     moves: list[Move] = []
-
-    peer_names_lower = {c.lower() for c in PEER_SETS.get(peer_set_name, [])}
 
     for line in lines:
         direction, _ = classify_direction(line)
@@ -513,14 +465,13 @@ def parse_moves(text: str, peer_set_name: str = "Canada") -> pd.DataFrame:
         move_date = extract_date(line)
         source = extract_source(line)
 
-        # Assign prior/new company by direction + order of mention when possible.
         prior_company, new_company = "", ""
         if companies:
             if direction == "Outbound":
                 prior_company = companies[0]
             elif direction == "Inbound":
                 new_company = companies[0]
-            else:  # Internal or Unclassified — same company both sides if only one found
+            else:
                 if len(companies) >= 2:
                     prior_company, new_company = companies[0], companies[1]
                 else:
@@ -531,51 +482,30 @@ def parse_moves(text: str, peer_set_name: str = "Canada") -> pd.DataFrame:
 
         moves.append(
             Move(
-                person=person,
-                direction=direction,
-                prior_title=prior_title,
-                new_title=new_title,
-                prior_company=prior_company,
-                new_company=new_company,
-                date=move_date,
-                source=source,
-                title_delta=title_delta,
-                function=function,
-                raw_text=line,
+                person=person, direction=direction, prior_title=prior_title, new_title=new_title,
+                prior_company=prior_company, new_company=new_company, date=move_date, source=source,
+                title_delta=title_delta, function=function, raw_text=line,
             )
         )
 
     if not moves:
-        return pd.DataFrame(
-            columns=[
-                "Person", "Direction", "Prior Title", "New Title", "Prior Company",
-                "New Company", "Date", "Source", "Title Delta", "Function", "Raw Text",
-            ]
-        )
+        return pd.DataFrame(columns=MOVE_COLUMNS)
 
-    df = pd.DataFrame(
+    return pd.DataFrame(
         [
             {
-                "Person": m.person,
-                "Direction": m.direction,
-                "Prior Title": m.prior_title,
-                "New Title": m.new_title,
-                "Prior Company": m.prior_company,
-                "New Company": m.new_company,
-                "Date": m.date,
-                "Source": m.source,
-                "Title Delta": m.title_delta,
-                "Function": m.function,
-                "Raw Text": m.raw_text,
+                "Person": m.person, "Direction": m.direction, "Prior Title": m.prior_title,
+                "New Title": m.new_title, "Prior Company": m.prior_company, "New Company": m.new_company,
+                "Date": m.date, "Source": m.source, "Title Delta": m.title_delta,
+                "Function": m.function, "Raw Text": m.raw_text,
             }
             for m in moves
         ]
     )
-    return df
 
 
 # ---------------------------------------------------------------------------
-# "So What" analysis (rule-based counts/proportions)
+# So What (rule-based counts/proportions) — used inside Talent Flow Detail
 # ---------------------------------------------------------------------------
 
 
@@ -624,9 +554,7 @@ def build_retention_section(df: pd.DataFrame) -> str:
     if flagged:
         lines.append(
             f"⚠️ **Bench-strength-building risk flag:** {', '.join(flagged)} show high internal-promotion "
-            "share (≥60% with 2+ tracked moves) — could indicate deliberate succession planning, "
-            "but also a smaller external talent pool being tapped for that function. Worth benchmarking "
-            "whether that's a strength (deep bench) or a risk (limited external validation of leadership)."
+            "share (≥60% with 2+ tracked moves)."
         )
     else:
         lines.append("No function currently shows a disproportionately high internal-promotion share.")
@@ -665,62 +593,244 @@ def build_benchmarking_section(df: pd.DataFrame) -> str:
 
     if flagged:
         lines.append("")
-        lines.append(
-            f"⚠️ **Disproportionate external hiring:** {', '.join(flagged)} — 70%+ of tracked moves in "
-            "this function are external hires rather than internal promotion, which may signal a talent "
-            "gap internally or an aggressive external build-out strategy by peers."
-        )
+        lines.append(f"⚠️ **Disproportionate external hiring:** {', '.join(flagged)} — 70%+ external.")
 
     return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
-# Markdown export
+# Live snapshot report (flag + one-liner per peer, Bottom Line synthesis)
 # ---------------------------------------------------------------------------
 
-METHODOLOGY_TEXT = """
-### What counts as a valid move
-A row is treated as a trackable executive/leadership move only when the pasted
-text provides, at minimum:
-- **Person** — a named individual (not "a spokesperson" or an anonymous reference)
-- **Prior or New role context** — at least one side of the move (what they did
-  before and/or what they are moving into)
-- **Explicit source attribution** — the text names or clearly implies where the
-  information came from (a company press release, a named news outlet, a
-  quoted internal memo, etc.)
+FLAG_RED, FLAG_GREEN, FLAG_GRAY = "🔴", "🟢", "⚪"
 
-### What is excluded
-- **LinkedIn scraping or bulk profile monitoring.** This tool only processes
-  text a user has manually pasted from a specific, identifiable source — it
-  does not crawl, scrape, or bulk-ingest social profiles.
-- **Unconfirmed rumor or anonymous "sources say" content**, unless the pasted
-  text itself is from a reputable, named outlet reporting on the record. Vague
-  attribution (no outlet, no memo, no named source) should be treated with
-  caution and reviewed manually before inclusion in any external-facing report.
-- **Non-leadership/non-executive personnel changes.** This tool is scoped to
-  publicly disclosed executive and senior leadership moves only.
 
-### Scope statement
-Only **publicly disclosed** executive/leadership moves — i.e., moves a company
-or credible news outlet has already chosen to announce publicly — are tracked
-here. This tool does not perform individual-level surveillance of employees,
-does not track rank-and-file personnel changes, and is not a substitute for
-consent-based talent intelligence processes. All extracted rows are surfaced
-in an editable review table specifically so a human can correct, remove, or
-flag any row before it is used in reporting.
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_fetch_statcan():
+    return live_sources.fetch_statcan_lfs()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_fetch_bls():
+    return live_sources.fetch_bls_series()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_fetch_sec(peer_name: str):
+    return live_sources.fetch_sec_recent_filings(peer_name)
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def cached_fetch_trade_press():
+    return live_sources.fetch_trade_press_mentions(COMPANY_ALIASES)
+
+
+def compute_company_flag(peer: str, moves_df: pd.DataFrame | None, sec_result: dict | None) -> tuple[str, str]:
+    """Flag + one-liner for one peer.
+
+    Disclosed-fact basis only: SEC filing recency (US peers) and/or manually
+    reviewed Talent Flow Detail moves for this pull. Never infers "concerning"
+    sentiment from an unread filing list alone — a bare 8-K listing gets a
+    neutral flag with a pointer to go read it, not an assumed direction.
+    """
+    notes = []
+    flag = FLAG_GRAY
+
+    if moves_df is not None and not moves_df.empty:
+        peer_moves = moves_df[
+            (moves_df["Prior Company"] == peer) | (moves_df["New Company"] == peer)
+        ]
+        if not peer_moves.empty:
+            outbound_n = (peer_moves["Direction"] == "Outbound").sum()
+            inbound_n = (peer_moves["Direction"] == "Inbound").sum()
+            internal_n = (peer_moves["Direction"] == "Internal").sum()
+            if outbound_n > 0:
+                flag = FLAG_RED
+                notes.append(
+                    f"{outbound_n} outbound move(s) logged this pull (Disclosed fact, from pasted source text)."
+                )
+            elif inbound_n or internal_n:
+                flag = FLAG_GREEN
+                notes.append(
+                    f"{inbound_n} inbound / {internal_n} internal move(s) logged this pull (Disclosed fact)."
+                )
+
+    if sec_result is not None:
+        if sec_result["ok"] and sec_result["data"]:
+            most_recent = sec_result["data"][0]
+            filed = dt.date.fromisoformat(most_recent["filed"])
+            days_since = (dt.date.today() - filed).days
+            if days_since <= 45:
+                if flag == FLAG_GRAY:
+                    flag = FLAG_GREEN
+                notes.append(
+                    f"Recent {most_recent['form']} filed {most_recent['filed']} ({days_since}d ago) — "
+                    f"review for Item 5.02 leadership disclosures. (Disclosed fact, SEC EDGAR, "
+                    f"retrieved {sec_result['retrieved_at']})"
+                )
+            else:
+                notes.append(
+                    f"Most recent tracked SEC filing: {most_recent['form']} on {most_recent['filed']} "
+                    f"— no near-term signal. (Disclosed fact, SEC EDGAR)"
+                )
+        elif sec_result["ok"]:
+            notes.append("No recent 8-K/10-K/DEF 14A filings found on SEC EDGAR. (Disclosed fact)")
+        else:
+            notes.append(f"SEC EDGAR lookup unavailable for this peer: {sec_result['error']}")
+
+    if not notes:
+        notes.append("No new activity captured this pull — paste trade-press text in Talent Flow Detail to add signal.")
+
+    return flag, " ".join(notes)
+
+
+def build_bottom_line(market: str, flags: dict[str, str], macro_result: dict) -> str:
+    red_peers = [p for p, f in flags.items() if f == FLAG_RED]
+    green_peers = [p for p, f in flags.items() if f == FLAG_GREEN]
+
+    if red_peers:
+        headline = f"{', '.join(red_peers)} show outbound talent signals this pull — worth a closer read."
+    elif green_peers:
+        headline = f"{', '.join(green_peers)} show notable activity this pull (see each line for whether that's a logged move or a filing to review); no outbound signal logged."
+    else:
+        headline = "No peer shows a live or pasted signal this pull — this is a quiet snapshot, not a data gap."
+
+    macro_note = ""
+    if macro_result.get("ok"):
+        macro_note = " Sector-wide labour context is available in the Labour-Market Research tab (live, timestamped)."
+
+    return f"{headline}{macro_note}"
+
+
+# ---------------------------------------------------------------------------
+# Governance / Methodology text
+# ---------------------------------------------------------------------------
+
+METHODOLOGY_TEXT = f"""
+### Governance principles
+- **Only public, first-party, or government data**: company filings, press releases,
+  career pages, government labour data.
+- Named individuals are in-scope **only** for leadership/executive appointments already
+  disclosed in proxy circulars, 10-Ks/annual reports, or company newsroom releases.
+  This tool never scrapes, infers, or displays individual-level employee data.
+- Every figure is tagged **"Disclosed fact"** (directly stated in a named source) or
+  **"Inferred signal"** (a pattern this tool noticed, e.g. a title-seniority comparison) —
+  never blended without that tag.
+- Every data point carries a **source name, link, and retrieval timestamp**. No exceptions.
+- **Permanently excluded**: LinkedIn scraping/API, individual profile monitoring,
+  forum/rumor sources (Blind, TheLayoff.com, individual Glassdoor reviews) as citable facts.
+
+### Peer set (locked)
+- **Canada (5):** {", ".join(LOCKED_PEER_SETS["Canada"])}
+- **US (5):** {", ".join(LOCKED_PEER_SETS["US"])}
+
+Canada and US reports are always shown separately — never merged into one cross-market list.
+
+### Live data sources (tested and wired this session)
+- **Statistics Canada — Labour Force Survey** (WDS API, no key): live, cached hourly.
+- **U.S. Bureau of Labor Statistics** (public API, no key): live, cached hourly.
+- **SEC EDGAR** (submissions API, no key): recent 8-K / 10-K / DEF 14A filings for
+  MetLife, Prudential Financial, Lincoln Financial, and Principal Financial. **John
+  Hancock has no standalone SEC filer** — it is a wholly owned Manulife subsidiary, so
+  its own leadership-change 8-Ks (if any) would appear only under Manulife's own CIK,
+  which this tool does not track (Manulife is the home company, not a tracked peer).
+  A filing's presence is a Disclosed fact; whether it *contains* a leadership change is
+  **not** auto-detected — the flag points you to read the filing, it does not claim to
+  already know what's in it.
+
+### Trade-press RSS feeds (live, filtered)
+- **Executive Moves** (`executive-moves.com` — note the hyphen; `executivemoves.com` without
+  one is an unrelated parked domain-for-sale page) and **Insurance Edge** (`insurance-edge.net`)
+  both publish real, robots.txt-permitted RSS feeds. This tool fetches them live and keeps only
+  items whose title/description mentions one of the 10 locked peer companies — nothing is
+  auto-added to the move table; matches are surfaced for manual review and paste, per the
+  human-review requirement below. Most pulls will legitimately return zero matches since these
+  are general industry feeds, not peer-specific.
+
+### Sources tested and found NOT viable as live feeds (documented so no one re-tries blind)
+- **Job Bank Canada** open-data postings file: real, no-key, ~50K postings/month —
+  but has **no employer-name field**. Usable only for national/NOC-level stats
+  (e.g. total actuarial postings in Canada), not company-specific counts.
+- **Adzuna API**: requires a registered app_id/app_key (confirmed via a live
+  AUTH_FAIL response) — not wired in without real credentials.
+- **Company career pages** (e.g. Manulife's own): confirmed bot-blocked
+  (Akamai "Access Denied" on a direct request) — this tool does not attempt to
+  bypass bot detection. Job-posting counts from career pages stay manual-paste.
+- **SEDAR+, Ontario Mass Termination Notices, US WARN Act notices**: no public
+  machine-readable API found — manual-paste only.
+
+### What counts as a valid tracked move (manual-paste path)
+- **Person** — a named individual (not "a spokesperson" or anonymous reference)
+- **Prior or New role context** — at least one side of the move
+- **Explicit source attribution** — a named press release, outlet, or filing
+
+### Excluded from the manual-paste path
+- LinkedIn scraping or bulk profile monitoring — this tool only processes text a
+  user has manually pasted from a specific, identifiable source.
+- Unconfirmed rumor or anonymous "sources say" content, unless from a reputable
+  named outlet reporting on the record.
+- Non-leadership/non-executive personnel changes.
+
+### Role/function grouping — provisional
+Function tags shown throughout (Actuarial, Risk, Finance, HR/People, Technology,
+Operations, Legal, Marketing, Other) are a **placeholder keyword map**, not a settled
+taxonomy. Per governance decision, the real grouping should be based on Manulife's own
+current open postings, mapped to **NOC** (Canada) / **O\\*NET-SOC** (US) reference codes —
+that gets decided once a few weeks of real output exist, not hardcoded now.
+
+### Snapshot, not a diff
+Each report run is a **snapshot** — 🔴 concerning signal, 🟢 notable move, ⚪ nothing
+new this pull — with one synthesis sentence per peer. There is no week-over-week delta
+tracking in this version.
 """
 
 
 def build_markdown_export(
+    market: str,
+    flags: dict[str, tuple[str, str]],
+    bottom_line: str,
+    labour_market_md: str,
+    workforce_strategy_text: str,
     df: pd.DataFrame,
-    peer_set_name: str,
     sourcing_md: str,
     retention_md: str,
     benchmarking_md: str,
 ) -> str:
-    lines = ["# Talent Moves Tracker — Report", "", f"_Peer set: {peer_set_name}_", ""]
+    lines = [f"# Talent Moves Tracker — {market} Report", ""]
+    lines.append(f"_Generated {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}_")
+    lines.append("")
 
-    lines.append("## Tracked Moves")
+    lines.append("## 1. Talent Flow Tracker — Live Snapshot")
+    lines.append("")
+    for peer, (flag, note) in flags.items():
+        lines.append(f"- {flag} **{peer}** — {note}")
+    lines.append("")
+    lines.append(f"**Bottom Line:** {bottom_line}")
+    lines.append("")
+
+    lines.append("## 2. Workforce & Talent Strategy")
+    lines.append("")
+    lines.append(workforce_strategy_text.strip() if workforce_strategy_text.strip() else "_No notes entered this pull._")
+    lines.append("")
+
+    lines.append("## 3. Labour-Market Research")
+    lines.append("")
+    lines.append(labour_market_md)
+    lines.append("")
+
+    lines.append("## 4. So What")
+    lines.append("")
+    lines.append("### Sourcing")
+    lines.append(sourcing_md)
+    lines.append("")
+    lines.append("### Retention")
+    lines.append(retention_md)
+    lines.append("")
+    lines.append("### Benchmarking")
+    lines.append(benchmarking_md)
+    lines.append("")
+
+    lines.append("## Talent Flow Detail (full move table)")
     lines.append("")
     if df.empty:
         lines.append("_No moves recorded._")
@@ -733,19 +843,8 @@ def build_markdown_export(
         lines.append("|" + "---|" * len(export_cols))
         for _, row in df.iterrows():
             lines.append("| " + " | ".join(str(row.get(c, "")).replace("|", "/") for c in export_cols) + " |")
+    lines.append("")
 
-    lines.append("")
-    lines.append("## So What")
-    lines.append("")
-    lines.append("### Sourcing")
-    lines.append(sourcing_md)
-    lines.append("")
-    lines.append("### Retention")
-    lines.append(retention_md)
-    lines.append("")
-    lines.append("### Benchmarking")
-    lines.append(benchmarking_md)
-    lines.append("")
     lines.append("## Methodology")
     lines.append(METHODOLOGY_TEXT)
 
@@ -758,52 +857,190 @@ def build_markdown_export(
 
 DIRECTION_OPTIONS = ["Inbound", "Internal", "Outbound", "Unclassified"]
 TITLE_DELTA_OPTIONS = ["Promotion", "Lateral", "Expanded Remit"]
-FUNCTION_OPTIONS = ["Risk", "Finance", "HR/People", "Technology", "Operations", "Legal", "Marketing", "Other"]
+FUNCTION_OPTIONS = list(FUNCTION_KEYWORDS.keys()) + ["Other"]
 
 
-def render_sidebar() -> str:
+def render_sidebar() -> tuple[str, list[str]]:
     with st.sidebar:
         st.header("Settings")
-        peer_set_name = st.radio("Peer set", list(PEER_SETS.keys()), index=0)
-        st.caption(
-            "Direction classification and company extraction match against this peer set's "
-            "known company names."
-        )
+        market = st.radio("Market", list(LOCKED_PEER_SETS.keys()), index=0)
+        st.caption("Canada and US are separate reports — peers are never compared cross-market.")
+
+        all_peers = LOCKED_PEER_SETS[market]
+        selected_peers = st.multiselect("Peer companies", all_peers, default=all_peers)
+
         st.divider()
+        if st.button("🔄 Refresh live data", use_container_width=True):
+            cached_fetch_statcan.clear()
+            cached_fetch_bls.clear()
+            cached_fetch_sec.clear()
+            st.rerun()
+        st.caption("Live sources are cached for 1 hour to respect free-tier rate limits.")
+
+        st.divider()
+        st.subheader("Manual-paste input")
         if st.button("Load sample text"):
             st.session_state["source_text"] = SAMPLE_TEXT.strip()
             st.session_state.pop("parsed_df", None)
         if st.button("Clear all"):
             st.session_state["source_text"] = ""
             st.session_state.pop("parsed_df", None)
-    return peer_set_name
+
+    return market, selected_peers
 
 
-def render_input_and_parse(peer_set_name: str) -> None:
+def render_live_report_tab(market: str, peers: list[str], moves_df: pd.DataFrame | None) -> tuple[dict, str, str]:
+    st.subheader(f"{market} — Live Snapshot")
+    st.caption(
+        "🔴 concerning signal · 🟢 notable move · ⚪ nothing new this pull. Each line names its source "
+        "and whether it's a Disclosed fact or an Inferred signal — never blended."
+    )
+
+    flags: dict[str, tuple[str, str]] = {}
+
+    sec_results = {}
+    if market == "US":
+        for peer in peers:
+            sec_results[peer] = cached_fetch_sec(peer)
+
+    for peer in peers:
+        sec_result = sec_results.get(peer) if market == "US" else None
+        flag, note = compute_company_flag(peer, moves_df, sec_result)
+        flags[peer] = (flag, note)
+        st.markdown(f"{flag} **{peer}** — {note}")
+
+    flags_simple = {p: f for p, (f, _) in flags.items()}
+    macro_result = cached_fetch_statcan() if market == "Canada" else cached_fetch_bls()
+    bottom_line = build_bottom_line(market, flags_simple, macro_result)
+
+    st.divider()
+    st.markdown(f"**Bottom Line:** {bottom_line}")
+
+    if market == "US":
+        with st.expander("SEC EDGAR detail (raw filings checked)"):
+            for peer, result in sec_results.items():
+                st.markdown(f"**{peer}**")
+                if result["ok"]:
+                    st.caption(f"Source: {result['source']} · Retrieved {result['retrieved_at']}")
+                    if result["data"]:
+                        for row in result["data"]:
+                            st.markdown(f"- [{row['form']} — {row['filed']}]({row['url']})")
+                    else:
+                        st.caption("No matching filings found.")
+                else:
+                    st.warning(result["error"])
+
+    return flags, bottom_line, market
+
+
+def render_labour_market_tab(market: str) -> str:
+    st.subheader("Labour-Market Research (live)")
+
+    if market == "Canada":
+        result = cached_fetch_statcan()
+        source_label = "Statistics Canada — Labour Force Survey (WDS API)"
+    else:
+        result = cached_fetch_bls()
+        source_label = "U.S. Bureau of Labor Statistics (public API)"
+
+    if not result["ok"]:
+        st.error(f"Could not reach {source_label}: {result['error']}")
+        return f"_Live fetch failed: {result['error']}_"
+
+    st.caption(f"Source: {source_label} · Retrieved {result['retrieved_at']} (Disclosed fact — direct API read)")
+
+    md_lines = [f"Source: {source_label} · Retrieved {result['retrieved_at']}", ""]
+    for label, points in result["data"].items():
+        st.markdown(f"**{label}**")
+        if points:
+            table = pd.DataFrame(points)
+            st.dataframe(table, use_container_width=True, hide_index=True)
+            md_lines.append(f"**{label}**")
+            for p in points:
+                md_lines.append(f"- {p['period']}: {p['value']}")
+            md_lines.append("")
+        else:
+            st.caption("No data points returned.")
+
+    st.info(live_sources.JOB_BANK_NOTE)
+    st.caption(live_sources.ADZUNA_NOTE)
+    md_lines.append(f"_Note: {live_sources.JOB_BANK_NOTE}_")
+
+    return "\n".join(md_lines)
+
+
+def render_workforce_strategy_tab() -> str:
+    st.subheader("Workforce & Talent Strategy")
+    st.caption(
+        "MANUAL-PASTE: no public API surfaces peer workforce-strategy announcements "
+        "(AI upskilling programs, wellness benefits, RTO mandates, etc.) as structured data. "
+        "Paste notes from trade press / press releases below."
+    )
+    text = st.text_area(
+        "Workforce & talent strategy notes",
+        value=st.session_state.get("workforce_strategy_text", ""),
+        height=150,
+        key="workforce_strategy_text",
+    )
+    return text
+
+
+def render_trade_press_check() -> None:
+    st.subheader("0. Check trade press (live, filtered to locked peers)")
+    st.caption(
+        "LIVE: pulls the Executive Moves (Insurance) and Insurance Edge RSS feeds — both real, "
+        "robots.txt-permitted, no key needed — and keeps only items mentioning one of the 10 locked "
+        "peer companies. These are general industry feeds, so most pulls will legitimately return "
+        "zero matches; nothing here is auto-added to the move table — review and paste manually below."
+    )
+    if st.button("🔎 Check feeds now"):
+        st.session_state["_trade_press_result"] = cached_fetch_trade_press()
+
+    result = st.session_state.get("_trade_press_result")
+    if result is not None:
+        st.caption(f"Retrieved {result['retrieved_at']} · Source: {result['source']}")
+        if result["error"]:
+            st.warning(f"Some feeds failed: {result['error']}")
+        matches = result["data"]
+        if not matches:
+            st.info("No mentions of a locked peer company found in the latest feed items this pull.")
+        else:
+            for m in matches:
+                st.markdown(f"**{m['title']}** ({', '.join(m['matched_peers'])})")
+                st.caption(f"{m['feed']} · {m['pub_date']} · [{m['link']}]({m['link']})")
+                if st.button(f"Add headline to source text", key=f"add_{m['link']}"):
+                    existing = st.session_state.get("source_text", "")
+                    st.session_state["source_text"] = (existing + "\n" + m["title"]).strip()
+                    st.rerun()
+
+    st.divider()
+
+
+def render_talent_flow_detail_tab() -> pd.DataFrame | None:
+    render_trade_press_check()
+
     st.subheader("1. Paste source text")
     st.caption(
-        "Paste press releases, news snippets, or announcement text. One move per line/sentence "
-        "works best, but multi-clause sentences are also handled."
+        "MANUAL-PASTE: trade press, press releases, filing excerpts. One move per line/sentence "
+        "works best; multi-clause sentences are also handled."
     )
     text = st.text_area(
         "Source text",
         value=st.session_state.get("source_text", ""),
-        height=220,
+        height=200,
         key="source_text",
     )
 
     if st.button("Parse moves", type="primary", disabled=not text.strip()):
-        st.session_state["parsed_df"] = parse_moves(text, peer_set_name)
+        st.session_state["parsed_df"] = parse_moves(text)
 
-
-def render_review_table() -> pd.DataFrame | None:
     df = st.session_state.get("parsed_df")
     if df is None:
-        st.info("Paste text above and click **Parse moves** to get started (or load the sample text from the sidebar).")
+        st.info("Paste text above and click **Parse moves**, or load the sample text from the sidebar.")
         return None
 
     st.subheader("2. Review & correct")
-    st.caption("Edit any misclassified cells directly in the table below before exporting.")
+    st.caption("Edit any misclassified cells directly in the table below.")
 
     edited_df = st.data_editor(
         df,
@@ -817,68 +1054,80 @@ def render_review_table() -> pd.DataFrame | None:
         key="move_editor",
     )
     st.session_state["parsed_df"] = edited_df
+
+    if not edited_df.empty:
+        st.subheader("3. So What")
+        sourcing_tab, retention_tab, benchmarking_tab = st.tabs(["Sourcing", "Retention", "Benchmarking"])
+        sourcing_md = build_sourcing_section(edited_df)
+        retention_md = build_retention_section(edited_df)
+        benchmarking_md = build_benchmarking_section(edited_df)
+        with sourcing_tab:
+            st.markdown(sourcing_md)
+        with retention_tab:
+            st.markdown(retention_md)
+        with benchmarking_tab:
+            st.markdown(benchmarking_md)
+        st.session_state["_sourcing_md"] = sourcing_md
+        st.session_state["_retention_md"] = retention_md
+        st.session_state["_benchmarking_md"] = benchmarking_md
+
     return edited_df
 
 
-def render_so_what(df: pd.DataFrame) -> tuple[str, str, str]:
-    st.subheader("3. So What")
-
-    sourcing_tab, retention_tab, benchmarking_tab = st.tabs(["Sourcing", "Retention", "Benchmarking"])
-    sourcing_md = build_sourcing_section(df)
-    retention_md = build_retention_section(df)
-    benchmarking_md = build_benchmarking_section(df)
-
-    with sourcing_tab:
-        st.markdown(sourcing_md)
-    with retention_tab:
-        st.markdown(retention_md)
-    with benchmarking_tab:
-        st.markdown(benchmarking_md)
-
-    return sourcing_md, retention_md, benchmarking_md
-
-
 def render_methodology_tab() -> None:
-    st.subheader("Methodology")
-    with st.expander("What counts as a move, what's excluded, and scope", expanded=True):
+    st.subheader("Methodology & Governance")
+    with st.expander("Full governance & methodology note", expanded=True):
         st.markdown(METHODOLOGY_TEXT)
-
-
-def render_export(df: pd.DataFrame, peer_set_name: str, sourcing_md: str, retention_md: str, benchmarking_md: str) -> None:
-    st.subheader("4. Export")
-    markdown_report = build_markdown_export(df, peer_set_name, sourcing_md, retention_md, benchmarking_md)
-    st.download_button(
-        "Download report (.md)",
-        data=markdown_report,
-        file_name="talent_moves_report.md",
-        mime="text/markdown",
-    )
-    with st.expander("Preview Markdown"):
-        st.code(markdown_report, language="markdown")
 
 
 def main() -> None:
     st.title("🧭 Talent Moves Tracker")
-    st.caption(
-        "Rule-based extraction of executive/leadership moves from pasted text — no API key, "
-        "no external model calls."
+    st.caption("Competitive talent intelligence for Manulife People Analytics — live public data + manual-paste, never blended without a tag.")
+
+    market, peers = render_sidebar()
+
+    live_tab, detail_tab, labour_tab, strategy_tab, methodology_tab = st.tabs(
+        ["📡 Live Report", "📋 Talent Flow Detail", "📊 Labour-Market Research", "🧭 Workforce & Strategy", "📖 Methodology"]
     )
 
-    peer_set_name = render_sidebar()
+    moves_df = st.session_state.get("parsed_df")
 
-    tracker_tab, methodology_tab = st.tabs(["Tracker", "📖 Methodology"])
+    with detail_tab:
+        moves_df = render_talent_flow_detail_tab()
 
-    with tracker_tab:
-        render_input_and_parse(peer_set_name)
-        df = render_review_table()
-        if df is not None and not df.empty:
-            sourcing_md, retention_md, benchmarking_md = render_so_what(df)
-            render_export(df, peer_set_name, sourcing_md, retention_md, benchmarking_md)
-        elif df is not None:
-            st.warning("No moves parsed from the text — try adjusting the source text or check the Methodology tab.")
+    with live_tab:
+        flags, bottom_line, _ = render_live_report_tab(market, peers, moves_df)
+
+    with labour_tab:
+        labour_market_md = render_labour_market_tab(market)
+
+    with strategy_tab:
+        workforce_strategy_text = render_workforce_strategy_tab()
 
     with methodology_tab:
         render_methodology_tab()
+
+    st.sidebar.divider()
+    st.sidebar.subheader("Export")
+    export_df = moves_df if moves_df is not None else pd.DataFrame(columns=MOVE_COLUMNS)
+    markdown_report = build_markdown_export(
+        market=market,
+        flags=flags,
+        bottom_line=bottom_line,
+        labour_market_md=labour_market_md,
+        workforce_strategy_text=workforce_strategy_text,
+        df=export_df,
+        sourcing_md=st.session_state.get("_sourcing_md", "_No moves parsed yet._"),
+        retention_md=st.session_state.get("_retention_md", "_No moves parsed yet._"),
+        benchmarking_md=st.session_state.get("_benchmarking_md", "_No moves parsed yet._"),
+    )
+    st.sidebar.download_button(
+        f"Download {market} report (.md)",
+        data=markdown_report,
+        file_name=f"talent_moves_{market.lower()}_report.md",
+        mime="text/markdown",
+        use_container_width=True,
+    )
 
 
 if __name__ == "__main__":
