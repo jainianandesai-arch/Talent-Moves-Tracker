@@ -21,6 +21,7 @@ bot-blocked), so nobody re-attempts the same dead end blind.
 """
 
 import datetime as dt
+import email.utils as email_utils
 import os
 import re
 from dataclasses import dataclass
@@ -231,6 +232,47 @@ iA Financial Group elevated Marc Bouchard to Senior Director, Risk Management fr
 Lincoln Financial's General Counsel, Laura Bennett, resigned effective June 30, 2026, to pursue an opportunity outside the firm.
 MetLife hired Kevin Osei as Managing Director, Data & Analytics after five years at a Canadian pension fund, effective May 2026 (company announcement).
 """
+
+# ---------------------------------------------------------------------------
+# Timeframe filter — applied to WARN notices, SEC filings, and trade-press
+# moves so the whole app can be scoped to "last N days" from one control.
+# ---------------------------------------------------------------------------
+
+TIMEFRAME_OPTIONS = {"Last 30 days": 30, "Last 60 days": 60, "Last 90 days": 90, "Last 180 days": 180, "All time": None}
+
+
+def parse_date_any(date_str: str) -> dt.date | None:
+    """Parse a date string from any of the formats this app's live sources
+    actually produce: ISO ("2026-08-17" or "2026-06-30 00:00:00", from SEC/
+    WARN) or RFC822 ("Mon, 14 Sep 2026 12:00:00 +0000", from RSS pubDate).
+    Returns None if the string is empty or unparseable — callers should NOT
+    hide undated items on a None result, since that would silently drop real
+    data rather than filter it."""
+    if not date_str:
+        return None
+    date_str = str(date_str).strip()
+    try:
+        return dt.date.fromisoformat(date_str[:10])
+    except ValueError:
+        pass
+    try:
+        return email_utils.parsedate_to_datetime(date_str).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def within_timeframe(date_str: str, days: int | None) -> bool:
+    """True if date_str falls within the last `days` days of today. `days`
+    of None means "All time" (always true). An unparseable/missing date is
+    kept (True) rather than hidden, so a real row is never silently dropped
+    just because its date didn't parse."""
+    if days is None:
+        return True
+    parsed = parse_date_any(date_str)
+    if parsed is None:
+        return True
+    return (dt.date.today() - parsed).days <= days
+
 
 # ---------------------------------------------------------------------------
 # Parsing
@@ -761,16 +803,43 @@ def cached_fetch_trade_press():
     return live_sources.fetch_trade_press_mentions(COMPANY_ALIASES)
 
 
-def compute_company_flag(peer: str, moves_df: pd.DataFrame | None, sec_result: dict | None) -> tuple[str, str]:
+@st.cache_data(ttl=21600, show_spinner=False)
+def cached_fetch_ca_warn():
+    return live_sources.fetch_california_warn_notices(COMPANY_ALIASES)
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def cached_fetch_tx_warn():
+    return live_sources.fetch_texas_warn_notices(COMPANY_ALIASES)
+
+
+def compute_company_flag(
+    peer: str,
+    moves_df: pd.DataFrame | None,
+    sec_result: dict | None,
+    warn_notices: list[dict] | None = None,
+) -> tuple[str, str]:
     """Flag + one-liner for one peer.
 
-    Disclosed-fact basis only: SEC filing recency (US peers) and/or manually
-    reviewed Talent Flow Detail moves for this pull. Never infers "concerning"
-    sentiment from an unread filing list alone — a bare 8-K listing gets a
-    neutral flag with a pointer to go read it, not an assumed direction.
+    Disclosed-fact basis only: SEC filing recency (US peers), WARN Act layoff
+    notices (US peers, California + Texas), and/or live trade-press moves.
+    Never infers "concerning" sentiment from an unread filing list alone — a
+    bare 8-K listing gets a neutral flag with a pointer to go read it, not an
+    assumed direction. A WARN notice naming the peer directly IS treated as a
+    concerning signal, since a WARN filing is itself a disclosed layoff/
+    closure event, not just a filing to go read.
     """
     notes = []
     flag = FLAG_GRAY
+
+    peer_warn_notices = [n for n in (warn_notices or []) if peer in n.get("matched_peers", [])]
+    if peer_warn_notices:
+        flag = FLAG_RED
+        total_employees = sum(int(n["num_employees"]) for n in peer_warn_notices if str(n.get("num_employees", "")).isdigit())
+        notes.append(
+            f"{len(peer_warn_notices)} WARN Act notice(s) found naming this company "
+            f"({total_employees} employee(s) affected) — Disclosed fact, government filing."
+        )
 
     if moves_df is not None and not moves_df.empty and "Matched Locked Peer" in moves_df.columns:
         peer_moves = moves_df[moves_df["Matched Locked Peer"].fillna("").str.contains(peer, regex=False)]
@@ -997,7 +1066,7 @@ TITLE_DELTA_OPTIONS = ["Promotion", "Lateral", "Expanded Remit"]
 FUNCTION_OPTIONS = list(FUNCTION_KEYWORDS.keys()) + ["Other"]
 
 
-def render_sidebar() -> tuple[str, list[str]]:
+def render_sidebar() -> tuple[str, list[str], int | None]:
     with st.sidebar:
         st.header("Settings")
         market = st.radio("Market", list(LOCKED_PEER_SETS.keys()), index=0)
@@ -1007,38 +1076,55 @@ def render_sidebar() -> tuple[str, list[str]]:
         selected_peers = st.multiselect("Peer companies", all_peers, default=all_peers)
 
         st.divider()
+        timeframe_label = st.selectbox("Timeframe", list(TIMEFRAME_OPTIONS.keys()), index=2)
+        timeframe_days = TIMEFRAME_OPTIONS[timeframe_label]
+        st.caption("Applies to WARN notices, SEC filings, and trade-press moves wherever a date is available.")
+
+        st.divider()
         if st.button("🔄 Refresh live data", use_container_width=True):
             cached_fetch_statcan.clear()
             cached_fetch_bls.clear()
             cached_fetch_sec.clear()
             cached_fetch_trade_press.clear()
+            cached_fetch_ca_warn.clear()
+            cached_fetch_tx_warn.clear()
             st.rerun()
         st.caption(
             "Every source below is fetched live — no paste, no manual entry. Cached up to 1 hour "
             "to respect free-tier rate limits; use Refresh to force a new pull."
         )
 
-    return market, selected_peers
+    return market, selected_peers, timeframe_days
 
 
-def render_live_report_tab(market: str, peers: list[str], moves_df: pd.DataFrame | None) -> tuple[dict, str, str]:
+def render_live_report_tab(
+    market: str, peers: list[str], moves_df: pd.DataFrame | None, timeframe_days: int | None
+) -> tuple[dict, str, str]:
     st.subheader(f"{market} — Live Snapshot")
     st.caption(
         "🔴 concerning signal · 🟢 notable move · ⚪ nothing new this pull. Fully live — no paste, no "
         "manual entry. Each line names its source and whether it's a Disclosed fact or an Inferred "
-        "signal — never blended."
+        "signal — never blended. Scoped to the **Timeframe** selected in the sidebar."
     )
 
     flags: dict[str, tuple[str, str]] = {}
 
     sec_results = {}
+    warn_notices: list[dict] = []
     if market == "US":
         for peer in peers:
-            sec_results[peer] = cached_fetch_sec(peer)
+            result = cached_fetch_sec(peer)
+            if result["ok"]:
+                result = {**result, "data": [f for f in result["data"] if within_timeframe(f["filed"], timeframe_days)]}
+            sec_results[peer] = result
+        ca_result = cached_fetch_ca_warn()
+        tx_result = cached_fetch_tx_warn()
+        all_notices = (ca_result["data"] if ca_result["ok"] else []) + (tx_result["data"] if tx_result["ok"] else [])
+        warn_notices = [n for n in all_notices if within_timeframe(n["notice_date"], timeframe_days)]
 
     for peer in peers:
         sec_result = sec_results.get(peer) if market == "US" else None
-        flag, note = compute_company_flag(peer, moves_df, sec_result)
+        flag, note = compute_company_flag(peer, moves_df, sec_result, warn_notices)
         flags[peer] = (flag, note)
         st.markdown(f"{flag} **{peer}** — {note}")
 
@@ -1050,18 +1136,7 @@ def render_live_report_tab(market: str, peers: list[str], moves_df: pd.DataFrame
     st.markdown(f"**Bottom Line:** {bottom_line}")
 
     if market == "US":
-        with st.expander("SEC EDGAR detail (raw filings checked)"):
-            for peer, result in sec_results.items():
-                st.markdown(f"**{peer}**")
-                if result["ok"]:
-                    st.caption(f"Source: {result['source']} · Retrieved {result['retrieved_at']}")
-                    if result["data"]:
-                        for row in result["data"]:
-                            st.markdown(f"- [{row['form']} — {row['filed']}]({row['url']})")
-                    else:
-                        st.caption("No matching filings found.")
-                else:
-                    st.warning(result["error"])
+        st.caption("SEC filing detail and WARN Act notice detail are in the **📂 Filings** tab.")
 
     return flags, bottom_line, market
 
@@ -1114,6 +1189,92 @@ def render_labour_market_tab(market: str) -> str:
     return canada_md if market == "Canada" else us_md
 
 
+CANADA_MASS_TERMINATION_LAW_NOTE = """
+**Legal requirement, confirmed real:** Under Ontario's *Employment Standards Act, 2000* (s.58) and
+equivalent provisions in other provinces/territories, an employer terminating **50 or more employees**
+at one establishment within a **4-week period** must give special mass-termination notice and file
+**Form 1** with the Director of Employment Standards (Ontario) or the equivalent provincial ministry.
+The federal *Canada Labour Code* has a parallel "group termination" requirement for federally
+regulated employers, filed with the Labour Program (ESDC).
+
+**What's actually accessible, checked live this session:** these Form 1 / group-termination filings go
+**directly to government** and are **not published as open data** anywhere we could find — checked
+Ontario's open data portal (`data.ontario.ca`), BC's (`catalogue.data.gov.bc.ca`), and the federal
+portal (`open.canada.ca`); none carry a mass/group termination notice dataset. This is a real
+disclosure gap in Canada relative to the US: California and Texas both publish their WARN Act notices
+as open data (see the US side of this tab), but no Canadian jurisdiction currently does the same for
+its mass-termination filings. If a province ever publishes one, it can be wired in the same way as the
+California/Texas sources.
+"""
+
+
+def render_filings_tab(timeframe_days: int | None) -> None:
+    st.subheader("Filings")
+    st.caption(
+        "Regulatory/government filings relevant to workforce changes, for both countries. Not "
+        "restricted to the peer market selected in the sidebar — pick a country to view here. "
+        "Scoped to the **Timeframe** selected in the sidebar."
+    )
+
+    ca_tab, us_tab = st.tabs(["🇨🇦 Canada", "🇺🇸 US"])
+
+    with ca_tab:
+        st.markdown("#### Mass termination notices")
+        st.markdown(CANADA_MASS_TERMINATION_LAW_NOTE)
+
+    with us_tab:
+        st.markdown("#### SEC EDGAR — executive/leadership filings")
+        st.caption("8-K (Item 5.02 covers officer/director changes), 10-K, and DEF 14A (proxy) filings.")
+        for peer in LOCKED_PEER_SETS["US"]:
+            result = cached_fetch_sec(peer)
+            st.markdown(f"**{peer}**")
+            if result["ok"]:
+                filings = [f for f in result["data"] if within_timeframe(f["filed"], timeframe_days)]
+                st.caption(f"Source: {result['source']} · Retrieved {result['retrieved_at']}")
+                if filings:
+                    for row in filings:
+                        st.markdown(f"- [{row['form']} — {row['filed']}]({row['url']})")
+                else:
+                    st.caption("No matching filings within the selected timeframe.")
+            else:
+                st.warning(result["error"])
+
+        st.divider()
+        st.markdown("#### WARN Act layoff notices — California & Texas (live)")
+        st.caption(
+            "US WARN Act reporting is decentralized per state — no federal aggregator exists. California "
+            "(Excel report, updated Tue/Thu) and Texas (Socrata open-data API) both publish theirs; other "
+            "states checked (New York, Florida) had no equivalent stable public dataset."
+        )
+
+        ca_result = cached_fetch_ca_warn()
+        tx_result = cached_fetch_tx_warn()
+
+        for label, result, date_field in [
+            ("California EDD", ca_result, "notice_date"),
+            ("Texas Workforce Commission", tx_result, "notice_date"),
+        ]:
+            st.markdown(f"**{label}**")
+            if not result["ok"]:
+                st.error(f"Could not reach {result['source']}: {result['error']}")
+                continue
+            notices = [n for n in result["data"] if within_timeframe(n[date_field], timeframe_days)]
+            st.caption(
+                f"Source: {result['source']} · Retrieved {result['retrieved_at']} · "
+                f"{len(result['data'])} notice(s) fetched · {len(notices)} within the selected timeframe"
+            )
+            matches = [n for n in notices if n["matched_peers"]]
+            if matches:
+                st.warning(f"⚠️ {len(matches)} notice(s) name a locked peer:")
+                for n in matches:
+                    st.markdown(f"- **{n['company']}** ({', '.join(n['matched_peers'])}) — {n.get('num_employees', '?')} employees, {n.get('city', n.get('county', ''))}")
+            else:
+                st.caption("No notices in this timeframe name a locked peer.")
+            with st.expander(f"All {label} notices in timeframe ({len(notices)})"):
+                if notices:
+                    st.dataframe(pd.DataFrame(notices), use_container_width=True, hide_index=True)
+
+
 WORKFORCE_STRATEGY_NOTE = (
     "No public, no-key API surfaces peer workforce-strategy announcements (AI upskilling "
     "programs, wellness benefits, RTO mandates, etc.) as structured, fetchable data — this would "
@@ -1129,7 +1290,7 @@ def render_workforce_strategy_tab() -> str:
     return WORKFORCE_STRATEGY_NOTE
 
 
-def render_talent_flow_detail_tab() -> pd.DataFrame:
+def render_talent_flow_detail_tab(timeframe_days: int | None) -> pd.DataFrame:
     st.subheader("Talent Flow Detail — live, industry-wide")
     st.caption(
         "Fully automatic: pulls every item from the Executive Moves (Insurance) and Insurance Edge "
@@ -1137,7 +1298,8 @@ def render_talent_flow_detail_tab() -> pd.DataFrame:
         "a row below. Not restricted to the 10 locked peers or to a country: this shows every "
         "executive move either feed reports across the insurance industry. The **Matched Locked "
         "Peer** column flags rows relevant to our specific peer set — used by the Live Report tab — "
-        "but nothing here is hidden or filtered out. No paste, no manual entry."
+        "but nothing here is hidden or filtered out. No paste, no manual entry. Filtered by the "
+        "**Timeframe** control in the sidebar."
     )
 
     auto_df, fetch_result = fetch_auto_trade_press_moves()
@@ -1145,12 +1307,18 @@ def render_talent_flow_detail_tab() -> pd.DataFrame:
     if fetch_result["error"]:
         st.warning(f"Some feeds failed: {fetch_result['error']}")
 
+    if not auto_df.empty:
+        fetched_count = len(auto_df)
+        auto_df = auto_df[auto_df["Date"].apply(lambda d: within_timeframe(d, timeframe_days))].reset_index(drop=True)
+        if fetched_count != len(auto_df):
+            st.caption(f"{fetched_count} fetched this pull · {len(auto_df)} within the selected timeframe.")
+
     if auto_df.empty:
-        st.info("Both feeds returned no parseable move headlines this pull.")
+        st.info("Both feeds returned no parseable move headlines within the selected timeframe.")
         return auto_df
 
     matched_count = (auto_df["Matched Locked Peer"] != "").sum()
-    st.caption(f"{len(auto_df)} move(s) fetched this pull · {matched_count} match a locked peer.")
+    st.caption(f"{len(auto_df)} move(s) shown · {matched_count} match a locked peer.")
 
     st.subheader("Review")
     st.caption(
@@ -1309,19 +1477,22 @@ def main() -> None:
     st.title("🧭 Talent Moves Tracker")
     st.caption("Competitive talent intelligence for Manulife People Analytics — fully live sources, never blended without a tag.")
 
-    market, peers = render_sidebar()
+    market, peers, timeframe_days = render_sidebar()
 
-    live_tab, detail_tab, labour_tab, strategy_tab, ask_tab, methodology_tab = st.tabs(
-        ["📡 Live Report", "📋 Talent Flow Detail", "📊 Labour-Market Research", "🧭 Workforce & Strategy", "💬 Ask", "📖 Methodology"]
+    live_tab, detail_tab, filings_tab, labour_tab, strategy_tab, ask_tab, methodology_tab = st.tabs(
+        ["📡 Live Report", "📋 Talent Flow Detail", "📂 Filings", "📊 Labour-Market Research", "🧭 Workforce & Strategy", "💬 Ask", "📖 Methodology"]
     )
 
     moves_df = None
 
     with detail_tab:
-        moves_df = render_talent_flow_detail_tab()
+        moves_df = render_talent_flow_detail_tab(timeframe_days)
 
     with live_tab:
-        flags, bottom_line, _ = render_live_report_tab(market, peers, moves_df)
+        flags, bottom_line, _ = render_live_report_tab(market, peers, moves_df, timeframe_days)
+
+    with filings_tab:
+        render_filings_tab(timeframe_days)
 
     with labour_tab:
         labour_market_md = render_labour_market_tab(market)
